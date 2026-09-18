@@ -48,6 +48,9 @@ class CompilerCostmodelContractTest(unittest.TestCase):
                 "downgrade_llir",
                 "force_disable_ffts",
                 "get_cann_version_file_hash",
+                "is_910_95_family_arch",
+                "is_simt_supported",
+                "KIRIN_9020_ARCH",
         ]:
             setattr(utils_mod, name, lambda *args, **kwargs: False)
         utils_mod._get_auto_blockify_blacklist_reasons = lambda *args, **kwargs: []
@@ -93,6 +96,9 @@ class CompilerCostmodelContractTest(unittest.TestCase):
         cache_mod.get_dump_manager = lambda *args, **kwargs: dump_mgr
 
         utils_mod.is_compile_on_910_95 = lambda: False
+        utils_mod.KIRIN_9020_ARCH = "Kirin9020"
+        utils_mod.is_910_95_family_arch = lambda arch: arch in ("Ascend910_9589", "Kirin9020")
+        utils_mod.is_simt_supported = lambda arch: arch != "Kirin9020"
 
         sys.modules.update({
             "triton": triton_mod,
@@ -123,6 +129,37 @@ class CompilerCostmodelContractTest(unittest.TestCase):
         opt_costmodel = backend.parse_options({"enable_costmodel_backend": True})
         self.assertTrue(opt_costmodel.enable_costmodel_backend)
         self.assertFalse(opt_costmodel.use_bytecode)
+
+    def test_kirin9020_uses_a5_path_without_simt(self):
+        cmplr, _dump_mgr, GPUTarget = self._load_compiler_module()
+
+        backend = cmplr.AscendBackend(GPUTarget(backend="npu", arch="Kirin9020"))
+        options = backend.parse_options({})
+
+        self.assertTrue(options.compile_on_910_95)
+        self.assertFalse(options.force_simt_only)
+        self.assertFalse(options.force_simt_template)
+        self.assertEqual(options.parallel_mode, "simd")
+        self.assertEqual(options.compile_mode, "simd")
+
+        with self.assertRaisesRegex(ValueError, "not supported on Kirin9020"):
+            backend.parse_options({"compile_mode": "simt_only"})
+
+    def test_kirin9020_uses_compact_to_tensor_syntax(self):
+        cmplr, _dump_mgr, _GPUTarget = self._load_compiler_module()
+        explicit = (
+            "%0 = bufferization.to_tensor %arg0 restrict writable "
+            ": memref<?xf32> to tensor<?xf32>\n")
+        compact = (
+            "%0 = bufferization.to_tensor %arg0 restrict writable "
+            ": memref<?xf32>\n")
+
+        self.assertEqual(cmplr._normalize_to_tensor_syntax_for_target(explicit, "Kirin9020"), compact)
+        self.assertEqual(cmplr._normalize_to_tensor_syntax_for_target(explicit, "Ascend910_9589"), explicit)
+
+        # Do not erase a result type that cannot be inferred from the memref.
+        mismatched = explicit.replace("tensor<?xf32>", "tensor<16xf32>")
+        self.assertEqual(cmplr._normalize_to_tensor_syntax_for_target(mismatched, "Kirin9020"), mismatched)
 
 
 if __name__ == "__main__":

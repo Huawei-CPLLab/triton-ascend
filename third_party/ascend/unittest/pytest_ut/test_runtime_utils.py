@@ -35,6 +35,22 @@ def test_get_ascend_arch_from_env():
     assert result == "Ascend910_9599"
 
 
+def test_kirin9020_arch_capabilities(monkeypatch):
+    monkeypatch.setenv("TRITON_ASCEND_ARCH", "Kirin9020")
+    assert utils.get_ascend_arch_from_env() == "Kirin9020"
+    assert utils.is_910_95_family_arch("Kirin9020")
+    assert not utils.is_simt_supported("Kirin9020")
+    assert not utils.is_ffts_supported("Kirin9020")
+    assert utils.is_simt_supported("Ascend910_9589")
+
+
+def test_kirin9020_disables_libdevice_simt(monkeypatch):
+    monkeypatch.setenv("TRITON_ASCEND_ARCH", "Kirin9020")
+    monkeypatch.setenv("TRITON_ENABLE_LIBDEVICE_SIMT", "1")
+    monkeypatch.setattr(utils, "is_compile_on_910_95", lambda: True)
+    assert not utils.triton_enable_libdevice_simt()
+
+
 def test_get_byte_per_numel_supports_unsigned_integer_dtypes():
     assert runtime_utils.get_byte_per_numel(torch.uint16) == 2
     assert runtime_utils.get_byte_per_numel(torch.uint32) == 4
