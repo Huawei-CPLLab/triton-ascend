@@ -311,17 +311,48 @@ static bool isW3QH(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
   return true;
 }
 
-// W3-QS uses an 8-byte sub-tile per 32-element column group, where each byte
-// is broadcast across 4 consecutive column elements (columns >> 2).
+// W3-QS uses an 8-byte sub-tile per 32-element column group.
+// It can appear either in:
+// 1) The original pair-load formulation where qs0 and qs1 are loaded separately:
+//      qs0: (row * groups + (col >> 5)) * 8 + ((col & 31) >> 3) * 2 + 0
+//      qs1: (row * groups + (col >> 5)) * 8 + ((col & 31) >> 3) * 2 + 1
+// 2) The unified single-load formulation:
+//      qs_low2: (row * groups + (col >> 5)) * 8 + ((col & 31) >> 2)
+//
+// In all cases, the underlying physical memory contains 8 contiguous bytes per
+// 32-column group. Reconstructing the tile by broadcasting each byte across 4
+// consecutive columns (8 bytes * 4 = 32 columns) produces:
+//   cols 0..3: B0, cols 4..7: B1, cols 8..11: B2, cols 12..15: B3, ...
+// When multiplexed via tl.where(k < 4, qs_low2_0, qs_low2_1), elements with
+// k < 4 (cols 0..3, 8..11, 16..19, 24..27) sample B0, B2, B4, B6 (pair 0),
+// and elements with k >= 4 (cols 4..7, 12..15, 20..23, 28..31) sample B1, B3,
+// B5, B7 (pair 1), exactly matching ground truth while sharing a single DMA load.
 static bool isW3QS(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
   if (columns % 32 != 0 || offsets.empty())
     return false;
-  int64_t groups = columns / 32;
   if (static_cast<int64_t>(offsets.size()) != rows * columns)
     return false;
-  for (int64_t row = 0; row < rows; ++row)
+  int64_t groups = columns / 32;
+
+  // Check 1: Unified single-load formulation ((col & 31) >> 2)
+  bool matchesUnified = true;
+  for (int64_t row = 0; row < rows && matchesUnified; ++row)
     for (int64_t col = 0; col < columns; ++col) {
       int64_t expected = (row * groups + (col >> 5)) * 8 + ((col & 31) >> 2);
+      if (offsets[row * columns + col] != expected) {
+        matchesUnified = false;
+        break;
+      }
+    }
+  if (matchesUnified)
+    return true;
+
+  // Check 2: Pair-load formulation (((col & 31) >> 3) * 2 + pair)
+  int64_t pair = offsets[0] & 1;
+  for (int64_t row = 0; row < rows; ++row)
+    for (int64_t col = 0; col < columns; ++col) {
+      int64_t expected = (row * groups + (col >> 5)) * 8 +
+                         ((col & 31) >> 3) * 2 + pair;
       if (offsets[row * columns + col] != expected)
         return false;
     }
