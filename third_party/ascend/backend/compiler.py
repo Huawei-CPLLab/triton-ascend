@@ -366,6 +366,16 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         compile_on_910_95 = metadata["compile_on_910_95"]
         compile_mode = opt.compile_mode
         metadata["compile_mode"] = compile_mode
+        # This is a compiler option, not launch metadata. Reading only from
+        # metadata silently disabled the rewrite for normal kernel builds.
+        enable_packed_load_rewrite = getattr(
+            opt, "enable_packed_load_rewrite", False
+        )
+        if opt.debug:
+            print(
+                "PackedLoadRewrite pipeline option: "
+                f"enable_packed_load_rewrite={enable_packed_load_rewrite}"
+            )
         enable_mixed_cv = metadata.get("enable_mixed_cv")
         disable_auto_inject_block_sync = metadata.get("disable_auto_inject_block_sync")
         set_workspace_multibuffer = metadata.get("set_workspace_multibuffer")
@@ -387,7 +397,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             distributed.ascend_passes.ttgpuir.add_convert_triton_distributed_to_hivm(pm)
 
         ascend.passes.ttir.add_triton_control_flow_opt(pm)
-        ascend.passes.ttir.add_triton_to_structure(pm, False, False)
+        ascend.passes.ttir.add_triton_to_structure(pm, False, False, enable_packed_load_rewrite)
         ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, compile_mode)
         ascend.passes.ttir.add_triton_to_annotation(pm)
         ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, compile_mode)
@@ -395,7 +405,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_llvm(pm)
         ascend.passes.ttir.add_bubble_up_operation(pm)
-        ascend.passes.ttir.add_triton_to_structure(pm, False, False)
+        ascend.passes.ttir.add_triton_to_structure(pm, False, False, enable_packed_load_rewrite)
         ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, False, enable_select_analysis, compile_on_910_95,
                                                 compile_mode)
         # Restricted to 910_95/950. The merged buffer is written by two disjoint
@@ -1228,6 +1238,7 @@ class NPUOptions:
     # Deprecated constructor-only compatibility input.  The supplied value is
     # ignored and replaced with the lowering selector derived from GPUTarget.arch.
     compile_on_910_95: Optional[bool] = field(default=None, repr=False, kw_only=True)
+    enable_packed_load_rewrite: bool = False
     enable_warp_specialization: bool = False
     enable_persistent: bool = False
     optimize_epilogue: bool = False
@@ -1588,6 +1599,8 @@ class AscendBackend(BaseBackend):
                 object.__setattr__(options, "force_simt_template", False)
                 object.__setattr__(options, "parallel_mode", "simd")
                 object.__setattr__(options, "compile_mode", "simd")
+            if self.target.arch == KIRIN_9020_ARCH and "enable_packed_load_rewrite" not in opts:
+                object.__setattr__(options, "enable_packed_load_rewrite", True)
             if not internal_options:
                 _normalize_bishengir_simt_optimization_for_context(options, normalized_opts)
                 # Community JIT rejects the legacy launch keyword "stream"
