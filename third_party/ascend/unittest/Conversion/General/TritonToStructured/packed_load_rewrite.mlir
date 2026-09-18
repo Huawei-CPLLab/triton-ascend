@@ -260,6 +260,46 @@ module {
 // -----
 
 module {
+  tt.func public @w4_g64_strided(%base: !tt.ptr<i8>) -> tensor<16x128xi8> {
+    %r = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+    %c = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %rs = tt.expand_dims %r {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %cs = tt.expand_dims %c {axis = 0 : i32} : tensor<128xi32> -> tensor<1x128xi32>
+    %rb = tt.broadcast %rs : tensor<16x1xi32> -> tensor<16x128xi32>
+    %cb = tt.broadcast %cs : tensor<1x128xi32> -> tensor<16x128xi32>
+    %six = arith.constant 6 : i32
+    %thirtyone = arith.constant 31 : i32
+    %thirtytwo = arith.constant 32 : i32
+    %sixtyfour = arith.constant 64 : i32
+    %six_b = tt.splat %six : i32 -> tensor<16x128xi32>
+    %thirtyone_b = tt.splat %thirtyone : i32 -> tensor<16x128xi32>
+    %thirtytwo_b = tt.splat %thirtytwo : i32 -> tensor<16x128xi32>
+    %sixtyfour_b = tt.splat %sixtyfour : i32 -> tensor<16x128xi32>
+    %group = arith.shrsi %cb, %six_b : tensor<16x128xi32>
+    %in_group = arith.andi %cb, %thirtyone_b : tensor<16x128xi32>
+    %row_term = arith.muli %rb, %sixtyfour_b : tensor<16x128xi32>
+    %group_term = arith.muli %group, %thirtytwo_b : tensor<16x128xi32>
+    %offset0 = arith.addi %row_term, %group_term : tensor<16x128xi32>
+    %offset = arith.addi %offset0, %in_group : tensor<16x128xi32>
+    %ptrs = tt.splat %base : !tt.ptr<i8> -> tensor<16x128x!tt.ptr<i8>>
+    %ptr = tt.addptr %ptrs, %offset : tensor<16x128x!tt.ptr<i8>>, tensor<16x128xi32>
+    %v = tt.load %ptr : tensor<16x128x!tt.ptr<i8>>
+    tt.return %v : tensor<16x128xi8>
+  }
+}
+
+// Generalized packed load test: group size G=64 with 32 physical bytes per group (W4 strided).
+// Logical shape 16x128 -> 2 groups per row, 64 physical bytes per row -> 1024 bytes total.
+// CHECK-LABEL: tt.func public @w4_g64_strided
+// CHECK: tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32>
+// CHECK: tt.load
+// CHECK: tt.reshape
+// CHECK: tt.broadcast
+// CHECK: tt.reshape
+
+// -----
+
+module {
   tt.func public @irregular(%base: !tt.ptr<i8>) -> tensor<32xi8> {
     %offset = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32>
     %ptrs = tt.splat %base : !tt.ptr<i8> -> tensor<32x!tt.ptr<i8>>
@@ -275,3 +315,4 @@ module {
 // CHECK-LABEL: tt.func public @irregular
 // CHECK: tt.load
 // CHECK-NOT: tt.make_range {end = 256 : i32, start = 0 : i32}
+
