@@ -199,6 +199,16 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         force_simt_template = metadata["force_simt_template"]
         enable_sync_block_lock = metadata["enable_sync_block_lock"]
         enable_mask_fallback_conversion = metadata["enable_mask_fallback_conversion"]
+        # This is a compiler option, not launch metadata. Reading only from
+        # metadata silently disabled the rewrite for normal kernel builds.
+        enable_packed_load_rewrite = getattr(
+            opt, "enable_packed_load_rewrite", False
+        )
+        if opt.debug:
+            print(
+                "PackedLoadRewrite pipeline option: "
+                f"enable_packed_load_rewrite={enable_packed_load_rewrite}"
+            )
         optimize_dynamic_offset = metadata["optimize_dynamic_offset"]
         auto_blockify_size = metadata["auto_blockify_size"]
         enable_mixed_cv = metadata.get("enable_mixed_cv")
@@ -219,7 +229,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             ascend.passes.ttir.add_dag_ssbuffer(pm)
             passes.common.add_cse(pm)
             passes.common.add_canonicalizer(pm)
-        ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
+        ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset,
+                               enable_packed_load_rewrite)
         ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, force_simt_template,
                                                                enable_sync_block_lock)
         ascend.passes.ttir.add_triton_to_annotation(pm)
@@ -228,7 +239,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_llvm(pm)
         ascend.passes.ttir.add_bubble_up_operation(pm)
-        ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
+        ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset,
+                               enable_packed_load_rewrite)
         ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, enable_nd2nz_on_vector, enable_select_analysis,
                                                 compile_on_910_95)
         if metadata["enable_dynamic_cv_pipeline"]:
@@ -1028,6 +1040,7 @@ class NPUOptions:
     compile_on_910_95: bool = None
     optimize_dynamic_offset: bool = False
     enable_mask_fallback_conversion: bool = False
+    enable_packed_load_rewrite: bool = False
     enable_warp_specialization: bool = False
     enable_nd2nz_on_vector: bool = False
     enable_persistent: bool = False
@@ -1254,6 +1267,8 @@ class AscendBackend(BaseBackend):
                 object.__setattr__(options, "force_simt_template", False)
                 object.__setattr__(options, "parallel_mode", "simd")
                 object.__setattr__(options, "compile_mode", "simd")
+            if self.target.arch == KIRIN_9020_ARCH and "enable_packed_load_rewrite" not in opts:
+                object.__setattr__(options, "enable_packed_load_rewrite", True)
             # Costmodel path should avoid extra BC<->MLIR conversion stages
             # to keep compile-only autotune routing lightweight and stable.
             if getattr(options, "enable_costmodel_backend", False):
