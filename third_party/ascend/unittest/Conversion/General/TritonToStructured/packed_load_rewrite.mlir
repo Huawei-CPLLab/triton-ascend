@@ -89,6 +89,44 @@ module {
 // -----
 
 module {
+  tt.func public @w4(%base: !tt.ptr<i8>) {
+    %r = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32>
+    %c = tt.make_range {start = 0 : i32, end = 128 : i32} : tensor<128xi32>
+    %rs = tt.expand_dims %r {axis = 1 : i32} : tensor<16xi32> -> tensor<16x1xi32>
+    %cs = tt.expand_dims %c {axis = 0 : i32} : tensor<128xi32> -> tensor<1x128xi32>
+    %rb = tt.broadcast %rs : tensor<16x1xi32> -> tensor<16x128xi32>
+    %cb = tt.broadcast %cs : tensor<1x128xi32> -> tensor<16x128xi32>
+    %five = arith.constant 5 : i32
+    %fifteen = arith.constant 15 : i32
+    %sixteen = arith.constant 16 : i32
+    %sixtyfour = arith.constant 64 : i32
+    %five_b = tt.splat %five : i32 -> tensor<16x128xi32>
+    %fifteen_b = tt.splat %fifteen : i32 -> tensor<16x128xi32>
+    %sixteen_b = tt.splat %sixteen : i32 -> tensor<16x128xi32>
+    %sixtyfour_b = tt.splat %sixtyfour : i32 -> tensor<16x128xi32>
+    %group = arith.shrsi %cb, %five_b : tensor<16x128xi32>
+    %in_group = arith.andi %cb, %fifteen_b : tensor<16x128xi32>
+    %row_term = arith.muli %rb, %sixtyfour_b : tensor<16x128xi32>
+    %group_term = arith.muli %group, %sixteen_b : tensor<16x128xi32>
+    %offset0 = arith.addi %row_term, %group_term : tensor<16x128xi32>
+    %offset = arith.addi %offset0, %in_group : tensor<16x128xi32>
+    %ptrs = tt.splat %base : !tt.ptr<i8> -> tensor<16x128x!tt.ptr<i8>>
+    %ptr = tt.addptr %ptrs, %offset : tensor<16x128x!tt.ptr<i8>>, tensor<16x128xi32>
+    %v = tt.load %ptr : tensor<16x128x!tt.ptr<i8>>
+    tt.return
+  }
+}
+
+// W4 packs the logical matrix by a different formula; this branch confirms the
+// rewrite still recognizes the alternative mapping and emits the compact load
+// required for the physical buffer.
+// CHECK-LABEL: tt.func public @w4
+// CHECK: tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32>
+// CHECK: tt.load
+
+// -----
+
+module {
   tt.func public @irregular(%base: !tt.ptr<i8>) {
     %offset = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32>
     %ptrs = tt.splat %base : !tt.ptr<i8> -> tensor<32x!tt.ptr<i8>>
