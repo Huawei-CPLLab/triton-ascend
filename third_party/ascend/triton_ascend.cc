@@ -51,6 +51,11 @@ namespace py = pybind11;
 using namespace ir;
 using namespace mlir;
 
+// This file exposes a small Python-facing builder layer around lower-level MLIR
+// operations used by the Ascend backend.  The goal is not to introduce new
+// semantics; it is to let the Python compiler pipeline construct the exact
+// tensor, slice, and custom-op patterns the backend expects while keeping the
+// C++ side as the canonical implementation detail.
 void init_triton_ascend_ir(py::module &&m) {
   auto *builder_cls = ir::getBuilderClass();
   builder_cls
@@ -152,6 +157,10 @@ void init_triton_ascend_ir(py::module &&m) {
                  staticStrides);
              return ret;
            })
+      // Inter-core synchronization is represented by a custom operation whose
+      // payload is a small metadata tuple.  The builder here packages the mode
+      // and wire ID into the custom op attributes so the backend can lower it
+      // later without additional ad-hoc Python logic.
       .def("create_custom_op_for_inter_core_sync",
            [](TritonOpBuilder &self, std::string &op_name,
               std::string &mode_or_sender, int id) -> void {
@@ -359,10 +368,15 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
 
   m.def("add_triton_to_structure",
         [](mlir::PassManager &pm, bool enableMaskFallbackConversion,
-           bool optimizeDynamicOffset) {
+         bool optimizeDynamicOffset, bool enablePackedLoadRewrite) {
           pm.addPass(mlir::triton::createTritonToStructuredPass(
-              enableMaskFallbackConversion, optimizeDynamicOffset));
-        });
+        enableMaskFallbackConversion, optimizeDynamicOffset,
+        enablePackedLoadRewrite));
+      },
+      py::arg("pm"),
+      py::arg("enable_mask_fallback_conversion"),
+      py::arg("optimize_dynamic_offset"),
+      py::arg("enable_packed_load_rewrite") = false);
 
   m.def("add_triton_control_flow_opt", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTritonControlFlowOptPass());
