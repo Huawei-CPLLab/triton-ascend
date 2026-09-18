@@ -9,16 +9,17 @@
 #include "llvm/Support/MathExtras.h"
 
 #include <algorithm>
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::triton;
 
 namespace {
-// The packed-load rewrite handles a very specific class of kernels: logical
-// 2-D tensors that are stored in a compressed memory layout for qweight packs
-// (W3-QH, W3-QS, and W4).  The rewrite does not change the kernel's meaning;
-// it only recognizes the special offset pattern, loads the compact buffer once,
-// and reshapes/broadcasts the values back to the logical tensor shape.
+// The packed-load rewrite handles logical 2-D tensors stored in compressed
+// sub-byte memory layouts for quantized weights (such as W1, W2, W3-QH, W3-QS,
+// W4, etc.). The rewrite does not change the kernel's meaning; it recognizes
+// the packed offset pattern, loads the compact physical buffer once, and
+// reshapes/broadcasts the values back to the logical tensor shape.
 struct StaticTensor {
   SmallVector<int64_t> shape;
   SmallVector<int64_t> values;
@@ -31,7 +32,8 @@ struct StaticTensor {
 // The reason it exists is simple: before the pass rewrites a load, it must prove
 // that the offset expression is a compile-time-known tensor with the exact shape
 // required by a packed layout.  Once that proof succeeds, the code can inspect
-// the offset table and decide whether the load is W3-QH, W3-QS, or W4.
+// the offset table and deduce the layout parameters (group size, bitwidth,
+// and broadcast pattern).
 static FailureOr<StaticTensor> evaluate(Value value) {
   // The evaluator only handles ranked tensors whose shape is fixed at compile
   // time and whose element type is an integer/index.  That is enough for the
@@ -293,82 +295,136 @@ static Value scalarBase(Value value) {
   return value;
 }
 
-// W3-QH uses a row-major packed layout where each 32-element column group is
-// physically stored in a compact sub-tile.  The offset formula below matches the
-// actual memory ordering used by the upstream qweight packer.
-static bool isW3QH(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
-  if (columns % 32 != 0)
-    return false;
-  int64_t groups = columns / 32;
-  if (static_cast<int64_t>(offsets.size()) != rows * columns)
-    return false;
-  for (int64_t row = 0; row < rows; ++row)
-    for (int64_t col = 0; col < columns; ++col) {
-      int64_t expected = (row * groups + (col >> 5)) * 4 + ((col & 31) >> 3);
-      if (offsets[row * columns + col] != expected)
-        return false;
-    }
-  return true;
+// Layout descriptor and deduction engine for generic sub-byte packed tensors.
+// In quantized weight layouts, a logical 2-D tensor of shape [rows, columns]
+// is partitioned along the column dimension into groups of size G. Within each
+// group, P contiguous physical bytes are stored in memory, providing a
+// replication/expansion factor of R = G / P (corresponding to 8 / R bits per element).
+//
+// There are three canonical in-group placement patterns:
+// 1) Consecutive: byte p is broadcast across R consecutive columns: floor(k / R).
+//    Examples: W3-QH (G=32, P=4, R=8), W3-QS unified (G=32, P=8, R=4).
+// 2) Strided: the P bytes are interleaved across the group: k % P.
+//    Examples: W4 (G=32, P=16, R=2), W2 strided (G=32, P=8, R=4).
+// 3) PairSlot: physical group is accessed via dual half-group loads:
+//    floor(k / (2*R)) * 2 + pair.
+//    Examples: W3-QS pair loads (qs0 with pair=0, qs1 with pair=1).
+enum class PackedPatternKind {
+  Consecutive,
+  Strided,
+  PairSlot
+};
+
+struct PackedLayoutDescriptor {
+  int64_t groupSize = 0;      // G (e.g., 32, 64, 16, 128)
+  int64_t bytesPerGroup = 0;  // P (e.g., 4, 8, 16)
+  int64_t repeatCount = 0;    // R = G / P
+  PackedPatternKind kind = PackedPatternKind::Consecutive;
+  int64_t pairIndex = 0;      // 0 or 1 for PairSlot
+};
+
+static const char *stringifyPatternKind(PackedPatternKind kind) {
+  switch (kind) {
+  case PackedPatternKind::Consecutive:
+    return "consecutive";
+  case PackedPatternKind::Strided:
+    return "strided";
+  case PackedPatternKind::PairSlot:
+    return "pair-slot";
+  }
+  return "unknown";
 }
 
-// W3-QS uses an 8-byte sub-tile per 32-element column group.
-// It can appear either in:
-// 1) The original pair-load formulation where qs0 and qs1 are loaded separately:
-//      qs0: (row * groups + (col >> 5)) * 8 + ((col & 31) >> 3) * 2 + 0
-//      qs1: (row * groups + (col >> 5)) * 8 + ((col & 31) >> 3) * 2 + 1
-// 2) The unified single-load formulation:
-//      qs_low2: (row * groups + (col >> 5)) * 8 + ((col & 31) >> 2)
-//
-// In all cases, the underlying physical memory contains 8 contiguous bytes per
-// 32-column group. Reconstructing the tile by broadcasting each byte across 4
-// consecutive columns (8 bytes * 4 = 32 columns) produces:
-//   cols 0..3: B0, cols 4..7: B1, cols 8..11: B2, cols 12..15: B3, ...
-// When multiplexed via tl.where(k < 4, qs_low2_0, qs_low2_1), elements with
-// k < 4 (cols 0..3, 8..11, 16..19, 24..27) sample B0, B2, B4, B6 (pair 0),
-// and elements with k >= 4 (cols 4..7, 12..15, 20..23, 28..31) sample B1, B3,
-// B5, B7 (pair 1), exactly matching ground truth while sharing a single DMA load.
-static bool isW3QS(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
-  if (columns % 32 != 0 || offsets.empty())
-    return false;
-  if (static_cast<int64_t>(offsets.size()) != rows * columns)
-    return false;
-  int64_t groups = columns / 32;
+// Automatically deduce the packed layout parameters by analyzing the offset map.
+static std::optional<PackedLayoutDescriptor> deducePackedLayout(
+    ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
+  if (offsets.empty() || static_cast<int64_t>(offsets.size()) != rows * columns)
+    return std::nullopt;
 
-  // Check 1: Unified single-load formulation ((col & 31) >> 2)
-  bool matchesUnified = true;
-  for (int64_t row = 0; row < rows && matchesUnified; ++row)
-    for (int64_t col = 0; col < columns; ++col) {
-      int64_t expected = (row * groups + (col >> 5)) * 8 + ((col & 31) >> 2);
-      if (offsets[row * columns + col] != expected) {
-        matchesUnified = false;
-        break;
+  // Candidate group sizes G (typical quantization tile widths).
+  const int64_t candidateGroups[] = {32, 64, 16, 128};
+  for (int64_t G : candidateGroups) {
+    if (columns % G != 0)
+      continue;
+    int64_t numGroups = columns / G;
+
+    // Iterate candidate physical bytes per group P (powers of 2, P < G).
+    for (int64_t P = 1; P < G; P *= 2) {
+      int64_t R = G / P;
+
+      // Pattern 1: Consecutive (Block) Broadcast: (row * groups + g) * P + (k / R)
+      bool matchConsecutive = true;
+      for (int64_t r = 0; r < rows && matchConsecutive; ++r) {
+        for (int64_t c = 0; c < columns; ++c) {
+          int64_t g = c / G;
+          int64_t k = c % G;
+          int64_t expected = (r * numGroups + g) * P + (k / R);
+          if (offsets[r * columns + c] != expected) {
+            matchConsecutive = false;
+            break;
+          }
+        }
+      }
+      if (matchConsecutive) {
+        PackedLayoutDescriptor desc;
+        desc.groupSize = G;
+        desc.bytesPerGroup = P;
+        desc.repeatCount = R;
+        desc.kind = PackedPatternKind::Consecutive;
+        return desc;
+      }
+
+      // Pattern 2: Strided (Interleaved) Broadcast: (row * groups + g) * P + (k % P)
+      bool matchStrided = true;
+      for (int64_t r = 0; r < rows && matchStrided; ++r) {
+        for (int64_t c = 0; c < columns; ++c) {
+          int64_t g = c / G;
+          int64_t k = c % G;
+          int64_t expected = (r * numGroups + g) * P + (k % P);
+          if (offsets[r * columns + c] != expected) {
+            matchStrided = false;
+            break;
+          }
+        }
+      }
+      if (matchStrided) {
+        PackedLayoutDescriptor desc;
+        desc.groupSize = G;
+        desc.bytesPerGroup = P;
+        desc.repeatCount = R;
+        desc.kind = PackedPatternKind::Strided;
+        return desc;
+      }
+
+      // Pattern 3: Dual-Load Pair-Slot: (row * groups + g) * P + (k / (2*R)) * 2 + pair
+      if (P >= 2 && 2 * R <= G) {
+        int64_t pair = offsets[0] & 1;
+        bool matchPair = true;
+        for (int64_t r = 0; r < rows && matchPair; ++r) {
+          for (int64_t c = 0; c < columns; ++c) {
+            int64_t g = c / G;
+            int64_t k = c % G;
+            int64_t expected = (r * numGroups + g) * P + (k / (2 * R)) * 2 + pair;
+            if (offsets[r * columns + c] != expected) {
+              matchPair = false;
+              break;
+            }
+          }
+        }
+        if (matchPair) {
+          PackedLayoutDescriptor desc;
+          desc.groupSize = G;
+          desc.bytesPerGroup = P;
+          desc.repeatCount = R;
+          desc.kind = PackedPatternKind::PairSlot;
+          desc.pairIndex = pair;
+          return desc;
+        }
       }
     }
-  if (matchesUnified)
-    return true;
+  }
 
-  // Check 2: Pair-load formulation (((col & 31) >> 3) * 2 + pair)
-  int64_t pair = offsets[0] & 1;
-  for (int64_t row = 0; row < rows; ++row)
-    for (int64_t col = 0; col < columns; ++col) {
-      int64_t expected = (row * groups + (col >> 5)) * 8 +
-                         ((col & 31) >> 3) * 2 + pair;
-      if (offsets[row * columns + col] != expected)
-        return false;
-    }
-  return true;
-}
-
-static bool isW4(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
-  if (columns % 32 != 0 || static_cast<int64_t>(offsets.size()) != rows * columns)
-    return false;
-  for (int64_t row = 0; row < rows; ++row)
-    for (int64_t col = 0; col < columns; ++col) {
-      int64_t expected = row * (columns / 2) + (col >> 5) * 16 + (col & 15);
-      if (offsets[row * columns + col] != expected)
-        return false;
-    }
-  return true;
+  return std::nullopt;
 }
 
 // The compact load is the central optimization: instead of materializing a
@@ -430,20 +486,15 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
     return reject("offset shape differs from result shape");
   int64_t rows = resultType.getShape()[0];
   int64_t columns = resultType.getShape()[1];
-  bool w3qh = isW3QH(offsets->values, rows, columns);
-  bool w3qs = isW3QS(offsets->values, rows, columns);
-  bool w4 = isW4(offsets->values, rows, columns);
-  // If the offset table does not match any packaged-memory pattern, there is
-  // no compact-load optimization to apply and the original load must be kept as
-  //-is.
-  if (!w3qh && !w3qs && !w4)
-    return reject("offset map is not W3-QH, W3-QS, or W4");
+  auto layout = deducePackedLayout(offsets->values, rows, columns);
+  if (!layout)
+    return reject("offset map does not match any recognized packed layout");
 
-  // The physical load count is the number of elements in the compact backing
-  // buffer.  For W3-QH/W3-QS this is a packed 4/8-byte layout; for W4 it is a
-  // denser row-wise representation.
-  int64_t physical = (w3qh || w3qs) ? rows * (columns / 32) * (w3qs ? 8 : 4)
-                          : rows * (columns / 2);
+  int64_t G = layout->groupSize;
+  int64_t P = layout->bytesPerGroup;
+  int64_t R = layout->repeatCount;
+  int64_t groups = columns / G;
+  int64_t physical = rows * groups * P;
 
   // The rewrite emits a single compact load per base pointer and then reuses it
   // for every logical load that shares the same backing buffer and physical size.
@@ -463,23 +514,27 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
     return reject("base pointer is not a scalar tt.ptr");
 
   // The compact buffer is a flat 1-D tensor.  We reshape it into the logical
-  // packed shape, then expand the packed dimension back out so it matches the
-  // original dense logical tensor layout.  The exact dimension placement depends
-  // on whether we are handling W3 or W4.
+  // packed shape [rows, groups, P], then expand and broadcast the packed
+  // dimension back out so it matches the original dense logical tensor layout.
   auto compactType = cast<RankedTensorType>(compact.getType());
-  SmallVector<int64_t> packedShape =
-      w3qh ? SmallVector<int64_t>{rows, columns / 32, 4}
-           : (w3qs ? SmallVector<int64_t>{rows, columns / 32, 8}
-                   : SmallVector<int64_t>{rows, columns / 32, 16});
+  SmallVector<int64_t> packedShape{rows, groups, P};
   auto packed = rewriter.create<ReshapeOp>(
       op.getLoc(), RankedTensorType::get(packedShape, compactType.getElementType()),
       compact);
-  int64_t broadcastAxis = (w3qh || w3qs) ? 3 : 2;
+
+  // For Consecutive and PairSlot patterns, broadcast along axis 3:
+  // [rows, groups, P, 1] -> [rows, groups, P, R]
+  // In row-major flattening, P * R == G, producing [rows, columns].
+  //
+  // For Strided pattern, broadcast along axis 2:
+  // [rows, groups, 1, P] -> [rows, groups, R, P]
+  // In row-major flattening, R * P == G, producing [rows, columns].
+  int64_t broadcastAxis = (layout->kind == PackedPatternKind::Strided) ? 2 : 3;
   auto expanded = rewriter.create<ExpandDimsOp>(
       op.getLoc(), packed.getResult(), broadcastAxis);
   SmallVector<int64_t> expandedShape = packedShape;
   expandedShape.insert(expandedShape.begin() + broadcastAxis, 1);
-  expandedShape[broadcastAxis] = w3qh ? 8 : (w3qs ? 4 : 2);
+  expandedShape[broadcastAxis] = R;
   auto broadcast = rewriter.create<BroadcastOp>(
       op.getLoc(), RankedTensorType::get(expandedShape, compactType.getElementType()),
       expanded.getResult());
@@ -489,7 +544,9 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
 
   op.emitRemark() << "PackedLoadRewrite: logical shape=" << rows << "x" << columns
                   << " physical elements=" << physical
-                  << " reuse factor=" << (rows * columns) / physical
-                  << " kind=" << (w3qh ? "W3 QH" : (w3qs ? "W3 QS" : "W4 qweight"));
+                  << " reuse factor=" << R
+                  << " group size=" << G
+                  << " bytes/group=" << P
+                  << " pattern=" << stringifyPatternKind(layout->kind);
   return success();
 }
