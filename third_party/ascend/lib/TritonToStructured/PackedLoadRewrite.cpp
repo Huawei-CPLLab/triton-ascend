@@ -16,7 +16,7 @@ using namespace mlir::triton;
 namespace {
 // The packed-load rewrite handles a very specific class of kernels: logical
 // 2-D tensors that are stored in a compressed memory layout for qweight packs
-// (W3-QS).  The rewrite does not change the kernel's meaning;
+// (W3-QH and W3-QS).  The rewrite does not change the kernel's meaning;
 // it only recognizes the special offset pattern, loads the compact buffer once,
 // and reshapes/broadcasts the values back to the logical tensor shape.
 struct StaticTensor {
@@ -293,6 +293,24 @@ static Value scalarBase(Value value) {
   return value;
 }
 
+// W3-QH uses a row-major packed layout where each 32-element column group is
+// physically stored in a compact sub-tile.  The offset formula below matches the
+// actual memory ordering used by the upstream qweight packer.
+static bool isW3QH(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
+  if (columns % 32 != 0)
+    return false;
+  int64_t groups = columns / 32;
+  if (static_cast<int64_t>(offsets.size()) != rows * columns)
+    return false;
+  for (int64_t row = 0; row < rows; ++row)
+    for (int64_t col = 0; col < columns; ++col) {
+      int64_t expected = (row * groups + (col >> 5)) * 4 + ((col & 31) >> 3);
+      if (offsets[row * columns + col] != expected)
+        return false;
+    }
+  return true;
+}
+
 static FailureOr<int64_t> isW3QS(ArrayRef<int64_t> offsets, int64_t rows,
                                  int64_t columns) {
   if (columns % 32 != 0 || offsets.empty())
@@ -370,17 +388,18 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
     return reject("offset shape differs from result shape");
   int64_t rows = resultType.getShape()[0];
   int64_t columns = resultType.getShape()[1];
+  bool w3qh = isW3QH(offsets->values, rows, columns);
   auto w3qsPair = isW3QS(offsets->values, rows, columns);
   // If the offset table does not match any packaged-memory pattern, there is
   // no compact-load optimization to apply and the original load must be kept as
   //-is.
-  if (failed(w3qsPair))
-    return reject("offset map is not W3-QS");
+  if (!w3qh && failed(w3qsPair))
+    return reject("offset map is not W3-QH or W3-QS");
   bool w3qs = succeeded(w3qsPair);
 
   // The physical load count is the number of elements in the compact backing
-  // buffer.  For W3-QS this is a packed 8-bit layout.
-  int64_t physical = rows * (columns / 32) * 8;
+  // buffer.  For W3-QH/W3-QS this is a packed 4/8-bit layout.
+  int64_t physical = rows * (columns / 32) * (w3qs ? 8 : 4);
 
   // The rewrite emits a single compact load per base pointer and then reuses it
   // for every logical load that shares the same backing buffer and physical size.
@@ -445,6 +464,6 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
   op.emitRemark() << "PackedLoadRewrite: logical shape=" << rows << "x" << columns
                   << " physical elements=" << physical
                   << " reuse factor=" << (rows * columns) / physical
-                  << " kind=W3 QS";
+                  << " kind=" << (w3qh ? "W3 QH" : "W3 QS");
   return success();
 }
