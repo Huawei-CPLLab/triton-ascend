@@ -311,22 +311,21 @@ static bool isW3QH(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
   return true;
 }
 
-static FailureOr<int64_t> isW3QS(ArrayRef<int64_t> offsets, int64_t rows,
-                                 int64_t columns) {
+// W3-QS uses an 8-byte sub-tile per 32-element column group, where each byte
+// is broadcast across 4 consecutive column elements (columns >> 2).
+static bool isW3QS(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
   if (columns % 32 != 0 || offsets.empty())
-    return failure();
+    return false;
   int64_t groups = columns / 32;
-  int64_t pair = offsets[0] & 1;
-  if (pair > 1 || static_cast<int64_t>(offsets.size()) != rows * columns)
-    return failure();
+  if (static_cast<int64_t>(offsets.size()) != rows * columns)
+    return false;
   for (int64_t row = 0; row < rows; ++row)
     for (int64_t col = 0; col < columns; ++col) {
-      int64_t expected = (row * groups + (col >> 5)) * 8 +
-                         ((col & 31) >> 3) * 2 + pair;
+      int64_t expected = (row * groups + (col >> 5)) * 8 + ((col & 31) >> 2);
       if (offsets[row * columns + col] != expected)
-        return failure();
+        return false;
     }
-  return pair;
+  return true;
 }
 
 static bool isW4(ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
@@ -401,17 +400,16 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
   int64_t rows = resultType.getShape()[0];
   int64_t columns = resultType.getShape()[1];
   bool w3qh = isW3QH(offsets->values, rows, columns);
-  auto w3qsPair = isW3QS(offsets->values, rows, columns);
+  bool w3qs = isW3QS(offsets->values, rows, columns);
   bool w4 = isW4(offsets->values, rows, columns);
   // If the offset table does not match any packaged-memory pattern, there is
   // no compact-load optimization to apply and the original load must be kept as
   //-is.
-  if (!w3qh && failed(w3qsPair) && !w4)
-    return reject("offset map is not W3-QH or W3-QS");
-  bool w3qs = succeeded(w3qsPair);
+  if (!w3qh && !w3qs && !w4)
+    return reject("offset map is not W3-QH, W3-QS, or W4");
 
   // The physical load count is the number of elements in the compact backing
-  // buffer.  For W3-QH/W3-QS this is a packed 4/8-bit layout; for W4 it is a
+  // buffer.  For W3-QH/W3-QS this is a packed 4/8-byte layout; for W4 it is a
   // denser row-wise representation.
   int64_t physical = (w3qh || w3qs) ? rows * (columns / 32) * (w3qs ? 8 : 4)
                           : rows * (columns / 2);
@@ -439,39 +437,18 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
   // on whether we are handling W3 or W4.
   auto compactType = cast<RankedTensorType>(compact.getType());
   SmallVector<int64_t> packedShape =
-      (w3qh || w3qs) ? SmallVector<int64_t>{rows, columns / 32, w3qs ? 4 : 4}
-           : SmallVector<int64_t>{rows, columns / 32, 16};
-  Value packedInput = compact;
-  if (w3qs) {
-    // For W3-QS, the packed layout carries a second axis selecting the pair
-    // slot (0 or 1).  We first reshape to a 4-D packed tensor, extract the
-    // relevant slice for this pair, and then continue with the standard reshape.
-    packedShape.push_back(2);
-    auto packedFull = rewriter.create<ReshapeOp>(
-        op.getLoc(), RankedTensorType::get(packedShape, compactType.getElementType()),
-        compact);
-    SmallVector<OpFoldResult> offsets(4, rewriter.getIndexAttr(0));
-    offsets[3] = rewriter.getIndexAttr(*w3qsPair);
-    SmallVector<OpFoldResult> sizes = {
-        rewriter.getIndexAttr(rows), rewriter.getIndexAttr(columns / 32),
-        rewriter.getIndexAttr(4), rewriter.getIndexAttr(1)};
-    SmallVector<OpFoldResult> strides(4, rewriter.getIndexAttr(1));
-    auto sliceType = RankedTensorType::get(
-        {rows, columns / 32, 4, 1}, compactType.getElementType());
-    packedInput = rewriter.create<tensor::ExtractSliceOp>(
-        op.getLoc(), sliceType, packedFull.getResult(), offsets, sizes,
-        strides);
-    packedShape.pop_back();
-  }
+      w3qh ? SmallVector<int64_t>{rows, columns / 32, 4}
+           : (w3qs ? SmallVector<int64_t>{rows, columns / 32, 8}
+                   : SmallVector<int64_t>{rows, columns / 32, 16});
   auto packed = rewriter.create<ReshapeOp>(
       op.getLoc(), RankedTensorType::get(packedShape, compactType.getElementType()),
-      packedInput);
+      compact);
   int64_t broadcastAxis = (w3qh || w3qs) ? 3 : 2;
   auto expanded = rewriter.create<ExpandDimsOp>(
       op.getLoc(), packed.getResult(), broadcastAxis);
   SmallVector<int64_t> expandedShape = packedShape;
-  expandedShape.insert(expandedShape.begin() + broadcastAxis, w3qh ? 1 : 1);
-  expandedShape[broadcastAxis] = (w3qh || w3qs) ? 8 : 2;
+  expandedShape.insert(expandedShape.begin() + broadcastAxis, 1);
+  expandedShape[broadcastAxis] = w3qh ? 8 : (w3qs ? 4 : 2);
   auto broadcast = rewriter.create<BroadcastOp>(
       op.getLoc(), RankedTensorType::get(expandedShape, compactType.getElementType()),
       expanded.getResult());
