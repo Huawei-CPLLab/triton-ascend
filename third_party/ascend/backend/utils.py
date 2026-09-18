@@ -35,6 +35,20 @@ import pybind11
 # Lazy init for is_compile_on_910_95
 _is_compile_on_910_95 = None
 
+KIRIN_9020_ARCH = "Kirin9020"
+
+
+def is_910_95_family_arch(arch: str) -> bool:
+    """Return whether an architecture uses the 910_95/A5 compiler path."""
+    arch_lower = arch.lower()
+    return ("ascend910_95" in arch_lower or "ascend950" in arch_lower or "910_958b" in arch_lower
+            or arch_lower == KIRIN_9020_ARCH.lower())
+
+
+def is_simt_supported(arch: str) -> bool:
+    """Kirin9020 shares the A5 path but does not provide SIMT support."""
+    return arch.lower() != KIRIN_9020_ARCH.lower()
+
 
 def is_compile_on_910_95():
     global _is_compile_on_910_95
@@ -42,9 +56,7 @@ def is_compile_on_910_95():
         try:
             import acl
             name = acl.get_soc_name()
-            name_lower = name.lower()
-            _is_compile_on_910_95 = ("ascend910_95" in name_lower or "ascend950" in name_lower
-                                     or "910_958b" in name_lower)
+            _is_compile_on_910_95 = is_910_95_family_arch(name)
         except (ImportError, AttributeError):
             _is_compile_on_910_95 = False
     return _is_compile_on_910_95
@@ -548,6 +560,7 @@ def get_ascend_arch_from_env():
         "Ascend910_9581",
         "Ascend910_9589",
         "Ascend910_9599",
+        KIRIN_9020_ARCH,
     ]
     is_valid = arch in valid_arch_list
     if not is_valid:
@@ -565,7 +578,7 @@ def is_ffts_supported(arch: str):
     - Ascend910_95*: 910_95 does not support ffts. Return False.
     - Other arch: 910B/910D supports ffts. Return True.
     '''
-    if is_compile_on_910_95():
+    if is_910_95_family_arch(arch) or is_compile_on_910_95():
         return False
     if arch in ["Ascend910A", "Ascend310B4"]:
         return False
@@ -588,7 +601,14 @@ def triton_support_ffts():
 
 def triton_enable_libdevice_simt():
     enable_libdevice_simt = os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)
-    return enable_libdevice_simt and is_compile_on_910_95()
+    arch = get_ascend_arch_from_env()
+    if not arch:
+        try:
+            import acl
+            arch = acl.get_soc_name()
+        except (ImportError, AttributeError):
+            arch = ""
+    return enable_libdevice_simt and is_compile_on_910_95() and is_simt_supported(arch)
 
 
 def get_cann_version_file_hash():
