@@ -281,18 +281,32 @@ def _warn_deprecated_ascend_env_vars() -> None:
         _warn_deprecated_ascend_env_var(name)
 
 
+KIRIN_9020_ARCH = "Kirin9020"
+
+
+def is_910_95_family_arch(arch: str) -> bool:
+    """Return whether an architecture uses the 910_95/A5 compiler path."""
+    arch_lower = arch.lower()
+    return ("ascend910_95" in arch_lower or "ascend950" in arch_lower or "910_958b" in arch_lower
+            or arch_lower == KIRIN_9020_ARCH.lower())
+
+
+def is_simt_supported(arch: str) -> bool:
+    """Kirin9020 shares the A5 path but does not provide SIMT support."""
+    return arch.lower() != KIRIN_9020_ARCH.lower()
+
+
 def is_compile_on_910_95(arch: str = None) -> bool:
     """Return whether the compilation target belongs to the A5 generation."""
     if arch is not None:
-        return isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950"))
+        return isinstance(arch, str) and is_910_95_family_arch(arch)
 
     global _is_compile_on_910_95
     if _is_compile_on_910_95 is None:
         try:
             import acl
-            name_lower = acl.get_soc_name().lower()
-            _is_compile_on_910_95 = ("ascend910_95" in name_lower or "ascend950" in name_lower
-                                     or "910_958b" in name_lower)
+            name = acl.get_soc_name()
+            _is_compile_on_910_95 = is_910_95_family_arch(name)
         except (ImportError, AttributeError):
             _is_compile_on_910_95 = False
     return _is_compile_on_910_95
@@ -788,7 +802,7 @@ def ub_size_in_kbytes_for_arch(arch: str) -> int:
     """
     if not isinstance(arch, str) or not arch:
         return 0
-    if arch.startswith(("Ascend910_95", "Ascend950")):
+    if is_910_95_family_arch(arch):
         return 256
     if arch.startswith(("Ascend910A", "Ascend910B", "Ascend910D", "Ascend910_93", "Ascend310B")):
         return 192
@@ -877,7 +891,13 @@ def cann_version_compile_args():
 
 def triton_enable_libdevice_simt(arch: str = None) -> bool:
     """Return whether the environment switch selects SIMT libdevice."""
-    return bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and is_compile_on_910_95(arch)
+    if not arch:
+        try:
+            import acl
+            arch = acl.get_soc_name()
+        except (ImportError, AttributeError):
+            arch = ""
+    return bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and is_compile_on_910_95(arch) and is_simt_supported(arch)
 
 
 def get_cann_version_file_hash():
