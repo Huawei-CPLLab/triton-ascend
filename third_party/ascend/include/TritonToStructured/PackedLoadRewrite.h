@@ -3,13 +3,16 @@
 
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Value.h"
-#include "llvm/ADT/DenseMap.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+
+#include <map>
+#include <tuple>
 
 namespace mlir::triton {
 
 struct PackedLoadRewriteState {
-  llvm::DenseMap<std::pair<Value, int64_t>, Value> compactLoads;
+  // Key: (base pointer, baseOffset, physical elements, rowStride)
+  std::map<std::tuple<void *, int64_t, int64_t, int64_t>, Value> compactLoads;
 };
 
 // Packed quantized formats may express logical expansion in pointer
@@ -18,7 +21,7 @@ struct PackedLoadRewriteState {
 class PackedLoadRewrite : public OpRewritePattern<LoadOp> {
 public:
   PackedLoadRewrite(MLIRContext *context, PackedLoadRewriteState *state,
-                   PatternBenefit benefit = 1)
+                    PatternBenefit benefit = 1)
       : OpRewritePattern<LoadOp>(context, benefit), state(state) {}
 
   LogicalResult matchAndRewrite(LoadOp op,
