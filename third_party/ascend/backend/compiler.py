@@ -67,6 +67,9 @@ from triton.backends.ascend.utils import (
     graph_ub_budget_bytes_for_arch,
     ub_size_in_kbytes_for_arch,
     get_cann_version_file_hash,
+    is_910_95_family_arch,
+    is_simt_supported,
+    KIRIN_9020_ARCH,
 )
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.program_grid import (
@@ -321,6 +324,23 @@ def make_ttir(mod, metadata, opt):
     return mod
 
 
+_TO_TENSOR_EXPLICIT_RESULT_RE = re.compile(
+    r"(bufferization\.to_tensor[^\n]*:\s*memref<([^,<>'\"\s]+)>)\s+to\s+tensor<\2>")
+
+
+def _normalize_to_tensor_syntax_for_target(linalg: str, arch: str) -> str:
+    """Use the compact to_tensor syntax required by the Kirin middle end.
+
+    Only remove an explicit tensor result type when it exactly matches the
+    shape and element type of a layout-free memref operand.  The result type is
+    therefore still inferred by MLIR and the operation's semantics are
+    unchanged.
+    """
+    if arch != KIRIN_9020_ARCH:
+        return linalg
+    return _TO_TENSOR_EXPLICIT_RESULT_RE.sub(r"\1", linalg)
+
+
 def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
     # use triton_adapter to lower Triton-MLIR to linalg
     # Get Triton-MLIR as string
@@ -346,6 +366,16 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         compile_on_910_95 = metadata["compile_on_910_95"]
         compile_mode = opt.compile_mode
         metadata["compile_mode"] = compile_mode
+        # This is a compiler option, not launch metadata. Reading only from
+        # metadata silently disabled the rewrite for normal kernel builds.
+        enable_packed_load_rewrite = getattr(
+            opt, "enable_packed_load_rewrite", False
+        )
+        if opt.debug:
+            print(
+                "PackedLoadRewrite pipeline option: "
+                f"enable_packed_load_rewrite={enable_packed_load_rewrite}"
+            )
         enable_mixed_cv = metadata.get("enable_mixed_cv")
         disable_auto_inject_block_sync = metadata.get("disable_auto_inject_block_sync")
         set_workspace_multibuffer = metadata.get("set_workspace_multibuffer")
@@ -367,7 +397,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             distributed.ascend_passes.ttgpuir.add_convert_triton_distributed_to_hivm(pm)
 
         ascend.passes.ttir.add_triton_control_flow_opt(pm)
-        ascend.passes.ttir.add_triton_to_structure(pm, False, False)
+        ascend.passes.ttir.add_triton_to_structure(pm, False, False, enable_packed_load_rewrite)
         ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, compile_mode)
         ascend.passes.ttir.add_triton_to_annotation(pm)
         ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, compile_mode)
@@ -375,7 +405,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_llvm(pm)
         ascend.passes.ttir.add_bubble_up_operation(pm)
-        ascend.passes.ttir.add_triton_to_structure(pm, False, False)
+        ascend.passes.ttir.add_triton_to_structure(pm, False, False, enable_packed_load_rewrite)
         ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, False, enable_select_analysis, compile_on_910_95,
                                                 compile_mode)
         # Restricted to 910_95/950. The merged buffer is written by two disjoint
@@ -432,11 +462,13 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                                           set_workspace_multibuffer=set_workspace_multibuffer)
         _export_program_grid_metadata(mod, metadata)
 
+        linalg = _normalize_to_tensor_syntax_for_target(str(mod), opt.arch)
+
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
-            dump_manager.put(str(mod), "kernel.ttadapter.mlir", binary=False)
+            dump_manager.put(linalg, "kernel.ttadapter.mlir", binary=False)
 
-        return str(mod)
+        return linalg
 
 
 def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
@@ -507,6 +539,7 @@ def bc_to_linalg_by_bishengir_opt(bc_data: bytes, metadata, opt):
 
         # Read the generated MLIR text
         linalg_text = Path(mlir_path).read_text()
+        linalg_text = _normalize_to_tensor_syntax_for_target(linalg_text, opt.arch)
 
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
@@ -1143,13 +1176,13 @@ def get_libdevice():
 
 
 def _is_a5_target_arch(arch: str) -> bool:
-    return isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950"))
+    return isinstance(arch, str) and is_910_95_family_arch(arch)
 
 
 def _get_libdevice_compile_state(arch: str) -> tuple[bool, bool]:
     return (
         bool(os.getenv("TRITON_ENABLE_LIBDEVICE", False)),
-        bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and _is_a5_target_arch(arch),
+        bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and _is_a5_target_arch(arch) and is_simt_supported(arch),
     )
 
 
@@ -1177,6 +1210,8 @@ def _normalize_compile_mode(compile_mode, arch: str) -> str:
 
     if canonical_mode == "simt_only" and not _is_a5_target_arch(arch):
         raise ValueError('compile_mode="simt_only" is supported only on A5 targets.')
+    if canonical_mode == "simt_only" and not is_simt_supported(arch):
+        raise ValueError(f"compile_mode='simt_only' is not supported on {arch}")
     return canonical_mode
 
 
@@ -1203,6 +1238,7 @@ class NPUOptions:
     # Deprecated constructor-only compatibility input.  The supplied value is
     # ignored and replaced with the lowering selector derived from GPUTarget.arch.
     compile_on_910_95: Optional[bool] = field(default=None, repr=False, kw_only=True)
+    enable_packed_load_rewrite: bool = False
     enable_warp_specialization: bool = False
     enable_persistent: bool = False
     optimize_epilogue: bool = False
@@ -1346,7 +1382,7 @@ class NPUOptions:
         object.__setattr__(
             self,
             "compile_on_910_95",
-            isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950")),
+            isinstance(arch, str) and is_910_95_family_arch(arch),
         )
         try:
             normalized_rule_mask = normalize_graph_optimization_rule_mask(rule_mask)
@@ -1360,7 +1396,12 @@ class NPUOptions:
         compile_mode = str(_normalize_compile_mode(self.compile_mode, arch))
         object.__setattr__(self, "compile_mode", compile_mode)
 
-        if compile_mode == "simt_only":
+        if not is_simt_supported(arch):
+            object.__setattr__(self, "force_simt_only", False)
+            object.__setattr__(self, "force_simt_template", False)
+            object.__setattr__(self, "parallel_mode", "simd")
+            object.__setattr__(self, "compile_mode", "simd")
+        elif compile_mode == "simt_only":
             object.__setattr__(self, "is_pure_simt", True)
             object.__setattr__(self, "parallel_mode", "simt")
         else:
@@ -1551,6 +1592,15 @@ class AscendBackend(BaseBackend):
             # compile_on_910_95 is already resolved from the requested target.
             if options.enable_dynamic_cv_pipeline is None:
                 object.__setattr__(options, "enable_dynamic_cv_pipeline", options.compile_on_910_95)
+            if not is_simt_supported(self.target.arch):
+                if options.compile_mode == "simt_only":
+                    raise ValueError(f"compile_mode='simt_only' is not supported on {self.target.arch}")
+                object.__setattr__(options, "force_simt_only", False)
+                object.__setattr__(options, "force_simt_template", False)
+                object.__setattr__(options, "parallel_mode", "simd")
+                object.__setattr__(options, "compile_mode", "simd")
+            if self.target.arch == KIRIN_9020_ARCH and "enable_packed_load_rewrite" not in opts:
+                object.__setattr__(options, "enable_packed_load_rewrite", True)
             if not internal_options:
                 _normalize_bishengir_simt_optimization_for_context(options, normalized_opts)
                 # Community JIT rejects the legacy launch keyword "stream"
