@@ -557,6 +557,25 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
     return failure();
 
   auto compactType = cast<RankedTensorType>(compact.getType());
+
+  if (layout->kind == PackedPatternKind::Consecutive && llvm::isPowerOf2_64(R)) {
+    Value current = rewriter.create<ReshapeOp>(
+        op.getLoc(),
+        RankedTensorType::get({rows, physicalCols}, compactType.getElementType()),
+        compact);
+    int64_t curCols = physicalCols;
+    for (int64_t step = 1; step < R; step *= 2) {
+      auto joined = rewriter.create<JoinOp>(op.getLoc(), current, current);
+      curCols *= 2;
+      current = rewriter.create<ReshapeOp>(
+          op.getLoc(),
+          RankedTensorType::get({rows, curCols}, compactType.getElementType()),
+          joined.getResult());
+    }
+    rewriter.replaceOp(op, current);
+    return success();
+  }
+
   SmallVector<int64_t> packedShape{rows, groups, P};
   auto packed = rewriter.create<ReshapeOp>(
       op.getLoc(), RankedTensorType::get(packedShape, compactType.getElementType()),
