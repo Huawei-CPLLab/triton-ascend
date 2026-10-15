@@ -1254,6 +1254,30 @@ ReshapeConverter::matchAndRewrite(triton::ReshapeOp op, OpAdaptor adaptor,
   insertDebugNop(loc, rewriter);
   auto src = op.getSrc();
   auto dst = op.getResult();
+  auto dstType = dyn_cast<RankedTensorType>(dst.getType());
+
+  if (auto joinOp = src.getDefiningOp<triton::JoinOp>()) {
+    Value opa = rewriter.getRemappedValue(joinOp.getLhs());
+    Value opb = rewriter.getRemappedValue(joinOp.getRhs());
+    if (!opa)
+      opa = joinOp.getLhs();
+    if (!opb)
+      opb = joinOp.getRhs();
+    auto srcType = dyn_cast<RankedTensorType>(opa.getType());
+    if (dstType && srcType && dstType.getRank() == srcType.getRank() &&
+        dstType.getElementType() == srcType.getElementType()) {
+      int64_t lastDim = dstType.getRank() - 1;
+      if (dstType.getDimSize(lastDim) == 2 * srcType.getDimSize(lastDim) &&
+          llvm::equal(dstType.getShape().take_front(lastDim),
+                      srcType.getShape().take_front(lastDim))) {
+        auto interleaveOp = rewriter.create<hfusion::InterleaveOp>(
+            loc, dstType, ValueRange{opa, opb});
+        rewriter.replaceOp(op, interleaveOp.getResult());
+        return success();
+      }
+    }
+  }
+
   Value shape = rewriter.create<arith::ConstantOp>(
       loc,
       rewriter.getI64TensorAttr(cast<ShapedType>(dst.getType()).getShape()));
@@ -2390,9 +2414,45 @@ LogicalResult UnrealizedCastConverter::matchAndRewrite(
 LogicalResult
 JoinConverter::matchAndRewrite(triton::JoinOp op, OpAdaptor adaptor,
                                ConversionPatternRewriter &rewriter) const {
-  Value opa = op.getLhs();
-  Value opb = op.getRhs();
+  if (op.getResult().use_empty()) {
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+  Value opa = adaptor.getLhs();
+  Value opb = adaptor.getRhs();
+  if (!opa)
+    opa = op.getLhs();
+  if (!opb)
+    opb = op.getRhs();
   auto loc = op.getLoc();
+
+  // Check if this JoinOp is immediately followed by a ReshapeOp that collapses
+  // the inner 2 dimensions into a 2-D tensor (tl.interleave pattern:
+  // [..., D] + [..., D] -> [..., D, 2] -> [..., 2*D]).
+  // In this case, lower directly to a 2-D hfusion::InterleaveOp to avoid
+  // allocating a 3-D UB buffer with 2-byte innermost dimension which causes
+  // BiSheng to scalarize to vstus.post.s8.
+  if (op.getResult().hasOneUse()) {
+    if (auto reshapeOp =
+            dyn_cast<triton::ReshapeOp>(*op.getResult().getUsers().begin())) {
+      auto dstType = dyn_cast<RankedTensorType>(reshapeOp.getResult().getType());
+      auto srcType = dyn_cast<RankedTensorType>(opa.getType());
+      if (dstType && srcType && dstType.getRank() == srcType.getRank() &&
+          dstType.getElementType() == srcType.getElementType()) {
+        int64_t lastDim = dstType.getRank() - 1;
+        if (dstType.getDimSize(lastDim) == 2 * srcType.getDimSize(lastDim) &&
+            llvm::equal(dstType.getShape().take_front(lastDim),
+                        srcType.getShape().take_front(lastDim))) {
+          auto interleaveOp = rewriter.create<hfusion::InterleaveOp>(
+              loc, dstType, ValueRange{opa, opb});
+          rewriter.replaceOp(reshapeOp, interleaveOp.getResult());
+          rewriter.eraseOp(op);
+          return success();
+        }
+      }
+    }
+  }
 
   auto resType = dyn_cast<RankedTensorType>(op.getResult().getType());
   Value emptyOp = rewriter.create<tensor::EmptyOp>(loc, resType.getShape(),

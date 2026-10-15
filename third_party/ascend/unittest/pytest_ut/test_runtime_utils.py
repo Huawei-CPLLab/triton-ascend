@@ -116,6 +116,19 @@ def test_deprecated_simt_option_is_routed_once_during_in_place_normalization():
     assert options == {"compile_mode": "simt_only"}
 
 
+def test_kirin9020_arch_capabilities():
+    assert utils.is_910_95_family_arch("Kirin9020")
+    assert not utils.is_simt_supported("Kirin9020")
+    assert not utils.is_ffts_supported("Kirin9020")
+    assert utils.is_simt_supported("Ascend910_9589")
+
+
+def test_kirin9020_disables_libdevice_simt(monkeypatch):
+    monkeypatch.setenv("TRITON_ENABLE_LIBDEVICE_SIMT", "1")
+    monkeypatch.setattr(utils, "is_compile_on_910_95", lambda arch=None: True)
+    assert not utils.triton_enable_libdevice_simt("Kirin9020")
+
+
 def test_get_byte_per_numel_supports_unsigned_integer_dtypes():
     assert runtime_utils.get_byte_per_numel(torch.uint16) == 2
     assert runtime_utils.get_byte_per_numel(torch.uint32) == 4
