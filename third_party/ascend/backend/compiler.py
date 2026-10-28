@@ -754,10 +754,21 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         callback_path = os.path.join(tmpdir, "libkernel.so")
         _compile_option_list = get_common_bishengir_compile_options(metadata)
 
+        target_arch = getattr(opt, "target_arch", "") or getattr(metadata.get("target"), "arch", "")
         multibuffer = metadata.get("multibuffer")
         num_stages = metadata.get("num_stages")
 
-        if multibuffer is not None or num_stages is not None:
+        if target_arch == KIRIN_9020_ARCH:
+            multi_buffer_value = True
+            if multibuffer is not None and not multibuffer:
+                multi_buffer_value = False
+            elif num_stages is not None and num_stages == 1:
+                multi_buffer_value = False
+            _compile_option_list += [
+                f"--enable-auto-multi-buffer={multi_buffer_value}",
+                "--set-cv-pipeline-mode=off",
+            ]
+        elif multibuffer is not None or num_stages is not None:
             multi_buffer_value = True
             if multibuffer is not None and not multibuffer:
                 multi_buffer_value = False
