@@ -145,55 +145,9 @@ static bool checkVecScopeMainLoop(ModuleOp module) {
 // Nested regions inside the main_loop op are also walked, and scf.yield
 // terminators are skipped.
 static bool isMainLoopOnlyCopyOrFixpipe(ModuleOp module) {
-  // main_loop id -> (countCopy, countFixpipe)
-  llvm::DenseMap<int, std::pair<int, int>> idToCounts;
-
-  module.walk([&](Operation *op) -> WalkResult {
-    if (!isa<scf::ForOp, scf::WhileOp>(op)) {
-      return WalkResult::advance();
-    }
-    auto mainLoopAttr = op->getAttrOfType<IntegerAttr>(CVPipeline::kMainLoop);
-    if (!mainLoopAttr) {
-      return WalkResult::advance();
-    }
-
-    int id = mainLoopAttr.getInt();
-    auto &counts = idToCounts[id];
-
-    op->walk([&](mlir::Operation *innerOp) -> WalkResult {
-      // Skip the loop op itself (the walk visits it first)
-      if (innerOp == op) {
-        return WalkResult::advance();
-      }
-      // Skip yield terminators (they are not real ops)
-      if (isa<scf::YieldOp>(innerOp)) {
-        return WalkResult::advance();
-      }
-      if (isa<hivm::CopyOp>(innerOp)) {
-        ++counts.first;
-      } else if (isa<hivm::FixpipeOp>(innerOp)) {
-        ++counts.second;
-      }
-      return WalkResult::advance();
-    });
-
-    return WalkResult::advance();
-  });
-
-  // Only trigger fallback when EVERY main_loop id has only copy or only
-  // fixpipe (one count is zero). If at least one id has both copy and
-  // fixpipe ops, the dynamic CV pipeline still be applicable.
-  if (idToCounts.empty()) {
-    return false;
-  }
-
-  for (const auto &entry : idToCounts) {
-    if (entry.second.first != 0 && entry.second.second != 0) {
-      return false;
-    }
-  }
-
-  return true;
+  // Allow one-way producer-consumer CV interaction (e.g. Vector dequant feeding Cube matmul)
+  // so that DynamicCVPipeline can pipeline the dequantization with matmul.
+  return false;
 }
 
 static LogicalResult verifyMainLoop(ModuleOp module) {

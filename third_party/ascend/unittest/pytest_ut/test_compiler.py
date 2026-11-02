@@ -259,3 +259,34 @@ def test_unknown_options_remain_available_for_jit_validation(backend):
 
     assert raw == {"unknown_compile_option": True}
     assert "unknown_compile_option" not in options.__dict__
+
+
+def test_kirin9020_uses_a5_path_without_simt():
+    backend = compiler.AscendBackend(GPUTarget(backend="npu", arch="Kirin9020"))
+    options = backend.parse_options({})
+
+    assert options.compile_on_910_95
+    assert not options.force_simt_only
+    assert not options.force_simt_template
+    assert options.parallel_mode == "simd"
+    assert options.compile_mode == "simd"
+
+    with pytest.raises(ValueError, match="not supported on Kirin9020"):
+        backend.parse_options({"compile_mode": "simt_only"})
+
+
+def test_kirin9020_uses_compact_to_tensor_syntax():
+    explicit = (
+        "%0 = bufferization.to_tensor %arg0 restrict writable "
+        ": memref<?xf32> to tensor<?xf32>\n")
+    compact = (
+        "%0 = bufferization.to_tensor %arg0 restrict writable "
+        ": memref<?xf32>\n")
+
+    assert compiler._normalize_to_tensor_syntax_for_target(explicit, "Kirin9020") == compact
+    assert compiler._normalize_to_tensor_syntax_for_target(explicit, "Ascend910_9589") == explicit
+
+    # Do not erase a result type that cannot be inferred from the memref.
+    mismatched = explicit.replace("tensor<?xf32>", "tensor<16xf32>")
+    assert compiler._normalize_to_tensor_syntax_for_target(mismatched, "Kirin9020") == mismatched
+

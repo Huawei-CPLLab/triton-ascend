@@ -21,6 +21,7 @@
  */
 
 #include "TritonToStructured/TritonToStructuredPass.h"
+#include "TritonToStructured/PackedLoadRewrite.h"
 
 #include <cassert>
 #include <cstdint>
@@ -71,6 +72,9 @@
 using namespace mlir;
 using namespace triton;
 
+// The pass is built on top of the standard Triton + MLIR dialect stack.  This
+// keeps the rewrites valid when they materialize control-flow, affine, tensor,
+// Linalg, or memory operations during lowering.
 void TritonToStructuredPass::getDependentDialects(
     DialectRegistry &registry) const {
   registry.insert<func::FuncDialect, arith::ArithDialect, math::MathDialect,
@@ -80,6 +84,10 @@ void TritonToStructuredPass::getDependentDialects(
                   annotation::AnnotationDialect>();
 }
 
+// Canonicalization is intentionally split out from the structural rewrite so the
+// pass can first simplify pointer/broadcast patterns, then run the actual
+// Triton-to-structured memop lowering.  This reduces the number of cases that
+// need to be handled by the later conversions.
 void TritonToStructuredPass::populateTritonToStructuredCanonicalizationPatterns(
     RewritePatternSet &patterns) {
   // TODO enable this optimization after fixing the bisheng bug it causes in
@@ -114,6 +122,9 @@ void TritonToStructuredPass::populateTritonToStructuredPatterns(
                                                enableMaskFallbackConversion);
 }
 
+// Splat/broadcast comparisons are common in generated kernels and often encode
+// shape-constant logic.  Rewriting them early keeps the subsequent pattern
+// matching simpler and allows more direct reasoning about the actual dataflow.
 LogicalResult
 TritonToStructuredPass::processSplatBinaryOperations(ModuleOp moduleOp) {
   mlir::RewritePatternSet patterns(&getContext());
@@ -126,11 +137,26 @@ TritonToStructuredPass::processSplatBinaryOperations(ModuleOp moduleOp) {
   return success();
 }
 
+// The overall pipeline flow is:
+//   1. inventory the loads to understand the IR shape and pointer patterns
+//   2. optionally rewrite packed loads into compact physical loads
+//   3. run pointer/broadcast canonicalization
+//   4. lower Triton memops to structured form
+//   5. normalize the final IR with CSE/canonicalization again
+// This ordering keeps the pass robust: the packed-load rewrite is a very
+// specific optimization, but the general lowering still needs to run on the
+// cleaned-up IR that remains afterwards.
 void TritonToStructuredPass::runOnOperation() {
   auto moduleOp = getOperation();
-  ConversionTarget target(getContext());
   RewritePatternSet canonicalizerPatterns(&getContext());
 
+  if (enablePackedLoadRewrite) {
+    RewritePatternSet packedPatterns(&getContext());
+    PackedLoadRewriteState state;
+    packedPatterns.add<PackedLoadRewrite>(&getContext(), &state);
+    if (failed(applyPatternsGreedily(moduleOp, std::move(packedPatterns))))
+      moduleOp.emitWarning("PackedLoadRewrite failed");
+  }
   this->populateTritonToStructuredCanonicalizationPatterns(
       canonicalizerPatterns);
   if (failed(
@@ -167,7 +193,9 @@ triton::createTritonToStructuredPass() {
 
 std::unique_ptr<OperationPass<ModuleOp>>
 triton::createTritonToStructuredPass(bool enableMaskFallbackConversion,
-                                     bool optimizeDynamicOffset) {
+                                     bool optimizeDynamicOffset,
+                                     bool enablePackedLoadRewrite) {
   return std::make_unique<TritonToStructuredPass>(enableMaskFallbackConversion,
-                                                  optimizeDynamicOffset);
+                                                  optimizeDynamicOffset,
+                                                  enablePackedLoadRewrite);
 }

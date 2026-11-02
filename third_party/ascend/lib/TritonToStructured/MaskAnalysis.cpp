@@ -148,6 +148,10 @@ LogicalResult MaskState::parse(Value operand, const Location loc,
     return this->parseRem(op, loc, builder);
   } else if (auto op = operand.getDefiningOp<arith::DivSIOp>()) {
     return this->parseDiv(op, loc, builder);
+  } else if (auto op = operand.getDefiningOp<arith::ShRSIOp>()) {
+    return this->parseShR(op.getLhs(), op.getRhs(), loc, builder);
+  } else if (auto op = operand.getDefiningOp<arith::ShRUIOp>()) {
+    return this->parseShR(op.getLhs(), op.getRhs(), loc, builder);
   }
   LLVM_DEBUG({
     InFlightDiagnostic diag = emitWarning(loc)
@@ -740,6 +744,67 @@ LogicalResult MaskState::parseDiv(arith::DivSIOp divOp, const Location loc,
     this->dump();
     llvm::dbgs() << "----------------------------------------------\n";
   });
+  return success();
+}
+
+LogicalResult MaskState::parseShR(Value lhs, Value rhs, const Location loc,
+                                  OpBuilder &builder) {
+  if (!this->isEmpty()) {
+    return failure();
+  }
+
+  MaskState rhsState;
+  if (failed(rhsState.parse(rhs, loc, builder)))
+    return failure();
+
+  if (!rhsState.scalar)
+    return failure();
+
+  auto shiftInt = getIntAttr(rhsState.scalar);
+  if (!shiftInt.has_value() || shiftInt.value() < 0 || shiftInt.value() >= 64)
+    return failure();
+
+  int64_t divisor = 1LL << shiftInt.value();
+  auto divisorAttr = builder.getIndexAttr(divisor);
+
+  MaskState lhsState;
+  if (failed(lhsState.parse(lhs, loc, builder)))
+    return failure();
+
+  if (lhsState.scalar)
+    return failure();
+
+  SmallVector<dimInfo> newStateInfo;
+  auto zeroAttr = builder.getIndexAttr(0);
+  for (auto info : lhsState.stateInfo) {
+    if (info.hasBroadCast) {
+      newStateInfo.emplace_back(info);
+      continue;
+    }
+    if (!isMultiple(divisorAttr, info.shape) &&
+        !isMultiple(info.shape, divisorAttr)) {
+      return failure();
+    }
+
+    auto nonContiguousSize =
+        minOpFoldResult(divisorAttr, info.shape, loc, builder);
+    auto contiguousSize =
+        divOpFoldResult(info.shape, nonContiguousSize, loc, builder);
+
+    auto staticContiguousSize = getIntAttr(contiguousSize);
+    if (!staticContiguousSize.has_value()) {
+      return failure();
+    }
+
+    if (staticContiguousSize.value() != 0) {
+      auto newOffset = divOpFoldResult(info.offset, divisorAttr, loc, builder);
+      newStateInfo.emplace_back(newOffset, contiguousSize, info.dimIndex);
+    }
+
+    newStateInfo.emplace_back(zeroAttr, nonContiguousSize, info.dimIndex, true);
+  }
+
+  this->stateInfo = newStateInfo;
   return success();
 }
 

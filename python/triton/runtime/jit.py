@@ -398,33 +398,49 @@ def create_function_from_signature(sig, kparams, backend):
     assert len(sig.parameters) == len(kparams)
     # Create the function argument list and the dict entries for the return statement
     specialization = []
+    uses_alignment_specialization = False
+    alignment_specialization_name = "__triton_alignment_specialization"
+    integer_annotation_types = {"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"}
     # signature
     for name, kp in zip(sig.parameters.keys(), kparams):
         if kp.is_constexpr:
             specialization.append(f'("constexpr", {name})')
         else:
-            is_const = 'True' if kp.is_const else 'False'
-            specialize = 'False' if kp.do_not_specialize else 'True'
-            align = 'False' if kp.do_not_specialize_on_alignment else 'True'
-            ret = f"specialize_impl(backend, {name}, {is_const}, {specialize}, {align})"
+            is_const = kp.is_const
+            specialize = not kp.do_not_specialize
+            align = not kp.do_not_specialize_on_alignment
+            effective_align = alignment_specialization_name if align and specialize else "False"
+            ret = (f"specialize_impl(backend, {name}, {is_const}, {specialize}, "
+                   f"{effective_align})")
             if kp.annotation_type:
                 if isinstance(kp.annotation_type, str):
                     if kp.annotation_type == "u1" or kp.annotation_type[:2] in ["fp", "bf"]:
                         # we do not specialize non-constexpr floats and bools:
                         specialize = False
                 if specialize:
-                    specialization.append(f'("{kp.annotation_type}",) + {ret}[1:]')
+                    uses_alignment_specialization = uses_alignment_specialization or align
+                    if kp.annotation_type in integer_annotation_types:
+                        # An integer annotation constrains the type of runtime values, but must not discard a
+                        # constexpr classification already produced by the value specializer (for example, 1).
+                        specialization.append(f'(lambda ret: ret if ret[0] == "constexpr" '
+                                              f'else ("{kp.annotation_type}",) + ret[1:])({ret})')
+                    else:
+                        specialization.append(f'("{kp.annotation_type}",) + {ret}[1:]')
                 else:
                     # skip runtime specialization:
                     specialization.append(f'("{kp.annotation_type}", None)')
             else:
+                uses_alignment_specialization = uses_alignment_specialization or (align and specialize)
                 specialization.append(f"{ret}")
 
     # compute argument string for a given parameter
     arg = lambda x: x[0] if x[1].default is inspect.Parameter.empty else f"{x[0]}=default_{x[0]}"
+    alignment_specialization_init = (f"    {alignment_specialization_name} = "
+                                     "backend.use_alignment_specialization(options)\n"
+                                     if uses_alignment_specialization else "")
     func_body = f"""
 def dynamic_func({", ".join(list(map(arg, sig.parameters.items())) + ["**options"])}):
-    params = {{{', '.join([f"'{name}': {name}" for name in sig.parameters.keys()])}}}
+{alignment_specialization_init}    params = {{{', '.join([f"'{name}': {name}" for name in sig.parameters.keys()])}}}
     specialization = [{','.join(specialization)}]
     return params, specialization, options
 """
