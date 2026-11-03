@@ -23,18 +23,22 @@ namespace {
 struct StaticTensor {
   SmallVector<int64_t> shape;
   SmallVector<int64_t> values;
+  Value dynamicScalar;
+  SmallVector<int64_t> dynCoeffs;
 };
 
 // Small constant-folding evaluator used to recognize statically known pointer
-// arithmetic. This function accepts tensor-producing ops that appear in the
-// packed qweight offset patterns.
+// arithmetic (plus an optional linear row-stride scalar term `dynCoeffs[i] *
+// dynamicScalar`). This function accepts tensor-producing ops that appear in
+// the packed qweight offset patterns.
 static FailureOr<StaticTensor> evaluate(Value value) {
   auto type = dyn_cast<RankedTensorType>(value.getType());
   if (!type || !type.hasStaticShape() || !type.getElementType().isIntOrIndex())
     return failure();
   StaticTensor result;
   result.shape.assign(type.getShape().begin(), type.getShape().end());
-  result.values.resize(type.getNumElements());
+  result.values.resize(type.getNumElements(), 0);
+  result.dynCoeffs.resize(type.getNumElements(), 0);
 
   if (auto range = value.getDefiningOp<MakeRangeOp>()) {
     if (result.shape.size() != 1 || range.getStart() < 0 ||
@@ -56,11 +60,16 @@ static FailureOr<StaticTensor> evaluate(Value value) {
 
   if (auto splat = value.getDefiningOp<SplatOp>()) {
     auto scalar = splat.getSrc();
-    auto scalarConst = scalar.getDefiningOp<arith::ConstantIntOp>();
-    if (!scalarConst)
-      return failure();
-    std::fill(result.values.begin(), result.values.end(), scalarConst.value());
-    return result;
+    if (auto scalarConst = scalar.getDefiningOp<arith::ConstantIntOp>()) {
+      std::fill(result.values.begin(), result.values.end(), scalarConst.value());
+      return result;
+    }
+    if (scalar.getType().isIntOrIndex()) {
+      result.dynamicScalar = scalar;
+      std::fill(result.dynCoeffs.begin(), result.dynCoeffs.end(), 1);
+      return result;
+    }
+    return failure();
   }
 
   if (auto expand = value.getDefiningOp<ExpandDimsOp>()) {
@@ -77,6 +86,8 @@ static FailureOr<StaticTensor> evaluate(Value value) {
     if (expected != result.shape)
       return failure();
     result.values = source->values;
+    result.dynamicScalar = source->dynamicScalar;
+    result.dynCoeffs = source->dynCoeffs;
     return result;
   }
 
@@ -95,6 +106,7 @@ static FailureOr<StaticTensor> evaluate(Value value) {
     SmallVector<int64_t> sourceStrides(source->shape.size(), 1);
     for (int64_t i = source->shape.size() - 2; i >= 0; --i)
       sourceStrides[i] = sourceStrides[i + 1] * source->shape[i + 1];
+    result.dynamicScalar = source->dynamicScalar;
     for (int64_t linear = 0; linear < static_cast<int64_t>(result.values.size()); ++linear) {
       int64_t sourceLinear = 0;
       int64_t remainder = linear;
@@ -105,6 +117,7 @@ static FailureOr<StaticTensor> evaluate(Value value) {
           sourceLinear += coord * sourceStrides[i - leading];
       }
       result.values[linear] = source->values[sourceLinear];
+      result.dynCoeffs[linear] = source->dynCoeffs[sourceLinear];
     }
     return result;
   }
@@ -114,17 +127,68 @@ static FailureOr<StaticTensor> evaluate(Value value) {
     auto right = evaluate(rhs);
     if (failed(left) || failed(right) || left->shape != right->shape)
       return failure();
+    if (left->dynamicScalar || right->dynamicScalar)
+      return failure();
     StaticTensor combined = *left;
     for (size_t i = 0; i < combined.values.size(); ++i)
       combined.values[i] = operation(left->values[i], right->values[i]);
     return combined;
   };
-  if (auto add = value.getDefiningOp<arith::AddIOp>())
-    return binary(add.getLhs(), add.getRhs(), [](int64_t a, int64_t b) { return a + b; });
-  if (auto sub = value.getDefiningOp<arith::SubIOp>())
-    return binary(sub.getLhs(), sub.getRhs(), [](int64_t a, int64_t b) { return a - b; });
-  if (auto mul = value.getDefiningOp<arith::MulIOp>())
-    return binary(mul.getLhs(), mul.getRhs(), [](int64_t a, int64_t b) { return a * b; });
+  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    auto left = evaluate(add.getLhs());
+    auto right = evaluate(add.getRhs());
+    if (failed(left) || failed(right) || left->shape != right->shape)
+      return failure();
+    if (left->dynamicScalar && right->dynamicScalar &&
+        left->dynamicScalar != right->dynamicScalar)
+      return failure();
+    StaticTensor combined = *left;
+    combined.dynamicScalar =
+        left->dynamicScalar ? left->dynamicScalar : right->dynamicScalar;
+    for (size_t i = 0; i < combined.values.size(); ++i) {
+      combined.values[i] = left->values[i] + right->values[i];
+      combined.dynCoeffs[i] = left->dynCoeffs[i] + right->dynCoeffs[i];
+    }
+    return combined;
+  }
+  if (auto sub = value.getDefiningOp<arith::SubIOp>()) {
+    auto left = evaluate(sub.getLhs());
+    auto right = evaluate(sub.getRhs());
+    if (failed(left) || failed(right) || left->shape != right->shape)
+      return failure();
+    if (left->dynamicScalar && right->dynamicScalar &&
+        left->dynamicScalar != right->dynamicScalar)
+      return failure();
+    StaticTensor combined = *left;
+    combined.dynamicScalar =
+        left->dynamicScalar ? left->dynamicScalar : right->dynamicScalar;
+    for (size_t i = 0; i < combined.values.size(); ++i) {
+      combined.values[i] = left->values[i] - right->values[i];
+      combined.dynCoeffs[i] = left->dynCoeffs[i] - right->dynCoeffs[i];
+    }
+    return combined;
+  }
+  if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
+    auto left = evaluate(mul.getLhs());
+    auto right = evaluate(mul.getRhs());
+    if (failed(left) || failed(right) || left->shape != right->shape)
+      return failure();
+    if (left->dynamicScalar && right->dynamicScalar)
+      return failure();
+    StaticTensor combined = *left;
+    combined.dynamicScalar =
+        left->dynamicScalar ? left->dynamicScalar : right->dynamicScalar;
+    for (size_t i = 0; i < combined.values.size(); ++i) {
+      combined.values[i] = left->values[i] * right->values[i];
+      if (left->dynamicScalar)
+        combined.dynCoeffs[i] = left->dynCoeffs[i] * right->values[i];
+      else if (right->dynamicScalar)
+        combined.dynCoeffs[i] = right->dynCoeffs[i] * left->values[i];
+      else
+        combined.dynCoeffs[i] = 0;
+    }
+    return combined;
+  }
   if (auto band = value.getDefiningOp<arith::AndIOp>())
     return binary(band.getLhs(), band.getRhs(), [](int64_t a, int64_t b) { return a & b; });
   if (auto bor = value.getDefiningOp<arith::OrIOp>())
@@ -137,8 +201,19 @@ static FailureOr<StaticTensor> evaluate(Value value) {
     return binary(shru.getLhs(), shru.getRhs(), [](int64_t a, int64_t b) {
       return static_cast<int64_t>(static_cast<uint64_t>(a) >> b);
     });
-  if (auto shl = value.getDefiningOp<arith::ShLIOp>())
-    return binary(shl.getLhs(), shl.getRhs(), [](int64_t a, int64_t b) { return a << b; });
+  if (auto shl = value.getDefiningOp<arith::ShLIOp>()) {
+    auto left = evaluate(shl.getLhs());
+    auto right = evaluate(shl.getRhs());
+    if (failed(left) || failed(right) || left->shape != right->shape ||
+        right->dynamicScalar)
+      return failure();
+    StaticTensor combined = *left;
+    for (size_t i = 0; i < combined.values.size(); ++i) {
+      combined.values[i] = left->values[i] << right->values[i];
+      combined.dynCoeffs[i] = left->dynCoeffs[i] << right->values[i];
+    }
+    return combined;
+  }
   if (auto divs = value.getDefiningOp<arith::DivSIOp>())
     return binary(divs.getLhs(), divs.getRhs(), [](int64_t a, int64_t b) {
       return b != 0 ? a / b : 0;
@@ -193,7 +268,8 @@ static bool isAllTrueMask(Value value) {
     return false;
   auto lhs = evaluate(cmp.getLhs());
   auto rhs = evaluate(cmp.getRhs());
-  if (failed(lhs) || failed(rhs) || lhs->shape != rhs->shape)
+  if (failed(lhs) || failed(rhs) || lhs->shape != rhs->shape ||
+      lhs->dynamicScalar || rhs->dynamicScalar)
     return false;
   auto predicate = cmp.getPredicate();
   for (size_t i = 0; i < lhs->values.size(); ++i) {
@@ -239,9 +315,17 @@ static FailureOr<StaticTensor> evaluatePointerOffset(Value value) {
     if (failed(parentOffset))
       return failure();
 
+    if (ownOffset->dynamicScalar && parentOffset->dynamicScalar &&
+        ownOffset->dynamicScalar != parentOffset->dynamicScalar)
+      return failure();
+    if (!ownOffset->dynamicScalar)
+      ownOffset->dynamicScalar = parentOffset->dynamicScalar;
+
     if (parentOffset->shape == ownOffset->shape) {
-      for (size_t i = 0; i < ownOffset->values.size(); ++i)
+      for (size_t i = 0; i < ownOffset->values.size(); ++i) {
         ownOffset->values[i] += parentOffset->values[i];
+        ownOffset->dynCoeffs[i] += parentOffset->dynCoeffs[i];
+      }
     } else {
       if (parentOffset->shape.size() != ownOffset->shape.size())
         return failure();
@@ -266,6 +350,7 @@ static FailureOr<StaticTensor> evaluatePointerOffset(Value value) {
             parentLinear += coordinate * parentStrides[dim];
         }
         ownOffset->values[linear] += parentOffset->values[parentLinear];
+        ownOffset->dynCoeffs[linear] += parentOffset->dynCoeffs[parentLinear];
       }
     }
     return ownOffset;
@@ -308,18 +393,36 @@ struct PackedLayoutDescriptor {
   PackedPatternKind kind = PackedPatternKind::Consecutive;
   int64_t pairIndex = 0;      // 0 or 1 for PairSlot
   int64_t baseOffset = 0;     // byte offset of (0, 0)
-  int64_t rowStride = 0;      // byte stride between successive rows
+  int64_t rowStride = 0;      // static byte stride between successive rows
+  Value dynamicRowStrideScalar;
+  int64_t dynamicRowStrideMultiplier = 0;
 };
 
 static std::optional<PackedLayoutDescriptor> deducePackedLayout(
-    ArrayRef<int64_t> offsets, int64_t rows, int64_t columns) {
+    const StaticTensor &tensor, int64_t rows, int64_t columns) {
+  ArrayRef<int64_t> offsets = tensor.values;
   if (offsets.empty() || static_cast<int64_t>(offsets.size()) != rows * columns)
     return std::nullopt;
+
+  int64_t dynMultiplier = 0;
+  if (tensor.dynamicScalar) {
+    if (rows <= 1)
+      return std::nullopt;
+    dynMultiplier = tensor.dynCoeffs[columns] - tensor.dynCoeffs[0];
+    if (dynMultiplier <= 0)
+      return std::nullopt;
+    for (int64_t r = 0; r < rows; ++r) {
+      for (int64_t c = 0; c < columns; ++c) {
+        if (tensor.dynCoeffs[r * columns + c] != r * dynMultiplier)
+          return std::nullopt;
+      }
+    }
+  }
 
   int64_t baseOffset = offsets[0];
   int64_t rowStride = (rows > 1) ? (offsets[columns] - offsets[0]) : 0;
 
-  // Verify that all rows follow the same rowStride.
+  // Verify that all rows follow the same static rowStride.
   if (rows > 1) {
     for (int64_t r = 1; r < rows; ++r) {
       if (offsets[r * columns] - offsets[0] != r * rowStride)
@@ -359,6 +462,8 @@ static std::optional<PackedLayoutDescriptor> deducePackedLayout(
         desc.kind = PackedPatternKind::Consecutive;
         desc.baseOffset = baseOffset;
         desc.rowStride = effectiveRowStride;
+        desc.dynamicRowStrideScalar = tensor.dynamicScalar;
+        desc.dynamicRowStrideMultiplier = dynMultiplier;
         return desc;
       }
 
@@ -384,6 +489,8 @@ static std::optional<PackedLayoutDescriptor> deducePackedLayout(
         desc.kind = PackedPatternKind::Strided;
         desc.baseOffset = baseOffset;
         desc.rowStride = effectiveRowStride;
+        desc.dynamicRowStrideScalar = tensor.dynamicScalar;
+        desc.dynamicRowStrideMultiplier = dynMultiplier;
         return desc;
       }
 
@@ -414,6 +521,8 @@ static std::optional<PackedLayoutDescriptor> deducePackedLayout(
           desc.pairIndex = pair;
           desc.baseOffset = pairBaseOffset;
           desc.rowStride = effectiveRowStride;
+          desc.dynamicRowStrideScalar = tensor.dynamicScalar;
+          desc.dynamicRowStrideMultiplier = dynMultiplier;
           return desc;
         }
       }
@@ -450,6 +559,8 @@ static Value createCompactLoad1D(Location loc, Value base, int64_t elements,
 
 static Value createCompactLoad2D(Location loc, Value base, int64_t rows,
                                  int64_t physicalCols, int64_t rowStride,
+                                 Value dynamicRowStrideScalar,
+                                 int64_t dynamicRowStrideMultiplier,
                                  int64_t baseOffset,
                                  PatternRewriter &rewriter) {
   auto basePtr = dyn_cast<PointerType>(base.getType());
@@ -466,8 +577,37 @@ static Value createCompactLoad2D(Location loc, Value base, int64_t rows,
 
   auto rowRange = rewriter.create<MakeRangeOp>(loc, rowType1D, 0, rows);
   auto rowExpanded = rewriter.create<ExpandDimsOp>(loc, rowType2D, rowRange, 1);
-  auto rowStrideConst = rewriter.create<arith::ConstantIntOp>(loc, rowStride, 32);
-  auto rowStrideSplat = rewriter.create<SplatOp>(loc, rowType2D, rowStrideConst);
+  Value rowStrideScalarVal;
+  if (dynamicRowStrideScalar) {
+    rowStrideScalarVal = dynamicRowStrideScalar;
+    if (rowStrideScalarVal.getType() != i32Type) {
+      if (rowStrideScalarVal.getType().isIndex())
+        rowStrideScalarVal =
+            rewriter.create<arith::IndexCastOp>(loc, i32Type, rowStrideScalarVal);
+      else if (rowStrideScalarVal.getType().getIntOrFloatBitWidth() < 32)
+        rowStrideScalarVal =
+            rewriter.create<arith::ExtSIOp>(loc, i32Type, rowStrideScalarVal);
+      else if (rowStrideScalarVal.getType().getIntOrFloatBitWidth() > 32)
+        rowStrideScalarVal =
+            rewriter.create<arith::TruncIOp>(loc, i32Type, rowStrideScalarVal);
+    }
+    if (dynamicRowStrideMultiplier != 1) {
+      auto mulConst = rewriter.create<arith::ConstantIntOp>(
+          loc, dynamicRowStrideMultiplier, 32);
+      rowStrideScalarVal =
+          rewriter.create<arith::MulIOp>(loc, rowStrideScalarVal, mulConst);
+    }
+    if (rowStride != 0) {
+      auto addConst = rewriter.create<arith::ConstantIntOp>(loc, rowStride, 32);
+      rowStrideScalarVal =
+          rewriter.create<arith::AddIOp>(loc, rowStrideScalarVal, addConst);
+    }
+  } else {
+    rowStrideScalarVal =
+        rewriter.create<arith::ConstantIntOp>(loc, rowStride, 32);
+  }
+  auto rowStrideSplat =
+      rewriter.create<SplatOp>(loc, rowType2D, rowStrideScalarVal);
   auto rowOffsets = rewriter.create<arith::MulIOp>(loc, rowExpanded, rowStrideSplat);
   auto rowBroadcast = rewriter.create<BroadcastOp>(loc, full2DIndexType, rowOffsets);
 
@@ -511,7 +651,7 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
 
   int64_t rows = resultType.getShape()[0];
   int64_t columns = resultType.getShape()[1];
-  auto layout = deducePackedLayout(offsets->values, rows, columns);
+  auto layout = deducePackedLayout(*offsets, rows, columns);
   if (!layout)
     return failure();
 
@@ -524,7 +664,12 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
 
   Value base = scalarBase(addptr.getPtr());
   using CompactKey = std::tuple<void *, int64_t, int64_t, int64_t>;
-  CompactKey key{base.getAsOpaquePointer(), layout->baseOffset, physicalTotal, layout->rowStride};
+  int64_t keyStride = layout->dynamicRowStrideScalar
+                          ? -(layout->dynamicRowStrideMultiplier * 1000000 +
+                              layout->rowStride)
+                          : layout->rowStride;
+  CompactKey key{base.getAsOpaquePointer(), layout->baseOffset, physicalTotal,
+                 keyStride};
 
   Value compact = Value();
   if (state) {
@@ -542,13 +687,17 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
   if (!compact) {
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPoint(op);
-    if (layout->rowStride == physicalCols && layout->baseOffset == 0) {
+    if (!layout->dynamicRowStrideScalar && layout->rowStride == physicalCols &&
+        layout->baseOffset == 0) {
       compact = createCompactLoad1D(op.getLoc(), base, physicalTotal, 0, rewriter);
-    } else if (layout->rowStride == physicalCols) {
+    } else if (!layout->dynamicRowStrideScalar &&
+               layout->rowStride == physicalCols) {
       compact = createCompactLoad1D(op.getLoc(), base, physicalTotal, layout->baseOffset, rewriter);
     } else {
-      compact = createCompactLoad2D(op.getLoc(), base, rows, physicalCols,
-                                    layout->rowStride, layout->baseOffset, rewriter);
+      compact = createCompactLoad2D(
+          op.getLoc(), base, rows, physicalCols, layout->rowStride,
+          layout->dynamicRowStrideScalar, layout->dynamicRowStrideMultiplier,
+          layout->baseOffset, rewriter);
     }
     if (state && compact)
       state->compactLoads[key] = compact;
