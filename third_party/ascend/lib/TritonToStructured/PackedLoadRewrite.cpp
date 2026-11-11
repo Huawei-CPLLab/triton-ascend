@@ -430,7 +430,11 @@ static std::optional<PackedLayoutDescriptor> deducePackedLayout(
     }
   }
 
-  const int64_t candidateGroups[] = {32, 64, 16, 128};
+  llvm::SmallVector<int64_t, 12> candidateGroups = {32, 64, 16, 128};
+  for (int64_t G = 2; G <= columns; G *= 2) {
+    if (columns % G == 0 && !llvm::is_contained(candidateGroups, G))
+      candidateGroups.push_back(G);
+  }
   for (int64_t G : candidateGroups) {
     if (columns % G != 0)
       continue;
@@ -663,13 +667,13 @@ LogicalResult PackedLoadRewrite::matchAndRewrite(
   int64_t physicalTotal = rows * physicalCols;
 
   Value base = scalarBase(addptr.getPtr());
-  using CompactKey = std::tuple<void *, int64_t, int64_t, int64_t>;
-  int64_t keyStride = layout->dynamicRowStrideScalar
-                          ? -(layout->dynamicRowStrideMultiplier * 1000000 +
-                              layout->rowStride)
-                          : layout->rowStride;
-  CompactKey key{base.getAsOpaquePointer(), layout->baseOffset, physicalTotal,
-                 keyStride};
+  PackedLoadRewriteState::CompactKey key{
+      base.getAsOpaquePointer(),
+      layout->baseOffset,
+      physicalTotal,
+      layout->rowStride,
+      layout->dynamicRowStrideScalar.getAsOpaquePointer(),
+      layout->dynamicRowStrideMultiplier};
 
   Value compact = Value();
   if (state) {

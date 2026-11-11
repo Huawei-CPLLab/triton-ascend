@@ -145,9 +145,44 @@ static bool checkVecScopeMainLoop(ModuleOp module) {
 // Nested regions inside the main_loop op are also walked, and scf.yield
 // terminators are skipped.
 static bool isMainLoopOnlyCopyOrFixpipe(ModuleOp module) {
-  // Allow one-way producer-consumer CV interaction (e.g. Vector dequant feeding Cube matmul)
-  // so that DynamicCVPipeline can pipeline the dequantization with matmul.
-  return false;
+  // main_loop id -> (countVecComm, countCubeComm)
+  // Include StoreOp/MmadL1Op alongside CopyOp/FixpipeOp so reduction main loops
+  // (where Vector stores dequantized tiles and Cube executes MmadL1Op while
+  // FixpipeOp sits outside the reduction loop) are recognized as valid CV loops.
+  llvm::DenseMap<int, std::pair<int, int>> idToCounts;
+
+  module.walk([&](Operation *op) -> WalkResult {
+    if (!isa<scf::ForOp, scf::WhileOp>(op))
+      return WalkResult::advance();
+    auto mainLoopAttr = op->getAttrOfType<IntegerAttr>(CVPipeline::kMainLoop);
+    if (!mainLoopAttr)
+      return WalkResult::advance();
+
+    int id = mainLoopAttr.getInt();
+    auto &counts = idToCounts[id];
+
+    op->walk([&](mlir::Operation *innerOp) -> WalkResult {
+      if (innerOp == op || isa<scf::YieldOp>(innerOp))
+        return WalkResult::advance();
+      if (isa<hivm::CopyOp, hivm::StoreOp>(innerOp))
+        ++counts.first;
+      else if (isa<hivm::FixpipeOp, hivm::MmadL1Op>(innerOp))
+        ++counts.second;
+      return WalkResult::advance();
+    });
+
+    return WalkResult::advance();
+  });
+
+  if (idToCounts.empty())
+    return false;
+
+  for (const auto &entry : idToCounts) {
+    if (entry.second.first != 0 && entry.second.second != 0)
+      return false;
+  }
+
+  return true;
 }
 
 static LogicalResult verifyMainLoop(ModuleOp module) {

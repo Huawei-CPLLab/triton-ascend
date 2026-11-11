@@ -11,8 +11,11 @@
 namespace mlir::triton {
 
 struct PackedLoadRewriteState {
-  // Key: (base pointer, baseOffset, physical elements, rowStride)
-  std::map<std::tuple<void *, int64_t, int64_t, int64_t>, Value> compactLoads;
+  // Key: (basePtr, baseOffset, physicalElements, staticRowStride,
+  //       dynamicRowStrideScalarPtr, dynamicRowStrideMultiplier)
+  using CompactKey =
+      std::tuple<const void *, int64_t, int64_t, int64_t, const void *, int64_t>;
+  std::map<CompactKey, Value> compactLoads;
 };
 
 // Packed quantized formats may express logical expansion in pointer

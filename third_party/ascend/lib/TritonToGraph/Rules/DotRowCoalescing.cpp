@@ -64,26 +64,22 @@ constexpr llvm::StringLiteral kCoalesceAxisAttr = "hacc.coalesce_axis";
 constexpr llvm::StringLiteral kCoalesceGridCeilDivAttr =
     "hacc.coalesce_grid_ceil_div";
 
+static bool isKirinTargetName(llvm::StringRef target) {
+  return target.equals_insensitive("kirin9020") ||
+         target.equals_insensitive("dav-l310") ||
+         target.equals_insensitive("l310");
+}
+
 static bool isKirinNPU(ModuleOp module) {
   if (!module)
     return false;
-  if (auto targetAttr = module->getAttrOfType<hacc::TargetAttr>(hacc::TargetAttr::name)) {
-    StringRef target = targetAttr.getTarget();
-    return target.equals_insensitive("kirin9020") ||
-           target.equals_insensitive("dav-l310") ||
-           target.equals_insensitive("l310");
-  }
-  if (auto strAttr = module->getAttrOfType<StringAttr>("hacc.target")) {
-    StringRef target = strAttr.getValue();
-    return target.equals_insensitive("kirin9020") ||
-           target.equals_insensitive("dav-l310") ||
-           target.equals_insensitive("l310");
-  }
-  if (auto strAttr = module->getAttrOfType<StringAttr>("target")) {
-    StringRef target = strAttr.getValue();
-    return target.equals_insensitive("kirin9020") ||
-           target.equals_insensitive("dav-l310") ||
-           target.equals_insensitive("l310");
+  if (auto targetAttr =
+          module->getAttrOfType<hacc::TargetAttr>(hacc::TargetAttr::name))
+    return isKirinTargetName(targetAttr.getTarget());
+  for (llvm::StringRef attrName : {"hacc.target", "target"}) {
+    if (auto strAttr = module->getAttrOfType<StringAttr>(attrName))
+      if (isKirinTargetName(strAttr.getValue()))
+        return true;
   }
   return false;
 }
@@ -226,14 +222,27 @@ static std::optional<RowAddressRange> analyzeRowAddress(Value v, Value pid) {
 
 static int64_t chooseRowCoalescingFactor(int64_t grid, int64_t maxDotRows,
                                          int64_t maxTensorBytes,
-                                         bool isKirin = false) {
+                                         ModuleOp module) {
   // Profitability policy, not a correctness requirement. Bound the widened M
   // dimension and the largest materialized value, including pointer tensors.
   // This is deliberately conservative, not a claim about peak live UB use or
   // an autotuned optimum. A known grid selects an exact factor; zero denotes
   // a runtime extent whose partial group is masked.
   constexpr int64_t targetDotRows = 128;
-  const int64_t maxLiftedValueBytes = isKirin ? (64 * 1024) : (128 * 1024);
+  int64_t maxLiftedValueBytes = 128 * 1024;
+  if (module) {
+    if (auto spec = hacc::utils::getNPUTargetSpec(module)) {
+      if (auto ubEntry = spec->getSpecForIdentifierEnum(hacc::DeviceSpec::UB_SIZE)) {
+        int64_t ubBytes = hacc::utils::getIntegerSpecValue(ubEntry) / 8;
+        if (ubBytes > 0 && ubBytes < 256 * 1024)
+          maxLiftedValueBytes = 64 * 1024;
+      }
+    } else if (isKirinNPU(module)) {
+      // The pinned AscendNPU-IR submodule predates Kirin9020Spec; apply the
+      // <256KB UB tier (64KB lifted-value cap) when targeting Kirin NPU.
+      maxLiftedValueBytes = 64 * 1024;
+    }
+  }
 
   for (int64_t factor : {32, 16, 8, 4, 2}) {
     if ((!grid || grid % factor == 0) && maxDotRows <= targetDotRows / factor &&
@@ -404,9 +413,8 @@ static std::optional<RowCandidate> matchDotRows(triton::FuncOp fn) {
   if (!step || *step <= 0)
     return std::nullopt;
 
-  const bool isKirin = isKirinNPU(module);
   int64_t rows = chooseRowCoalescingFactor(grid ? grid.getInt() : 0, maxDotRows,
-                                           maxTensorBytes, isKirin);
+                                           maxTensorBytes, module);
   if (rows <= 1)
     return std::nullopt;
 
