@@ -55,6 +55,15 @@ static bool isVectorScope(scope::ScopeOp scopeOp) {
   return coreTypeAttr.getTcoretype() == hivm::TCoreType::VECTOR;
 }
 
+static bool isCubeScope(scope::ScopeOp scopeOp) {
+  auto coreTypeAttr =
+      scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(hivm::TCoreTypeAttr::name);
+  if (!coreTypeAttr) {
+    return false;
+  }
+  return coreTypeAttr.getTcoretype() == hivm::TCoreType::CUBE;
+}
+
 static bool checkTransferInteraction(mlir::Operation *op) {
   bool hasCVInteraction = false;
   // check v->c data interaction
@@ -164,9 +173,14 @@ static bool isMainLoopOnlyCopyOrFixpipe(ModuleOp module) {
     op->walk([&](mlir::Operation *innerOp) -> WalkResult {
       if (innerOp == op || isa<scf::YieldOp>(innerOp))
         return WalkResult::advance();
-      if (isa<hivm::CopyOp, hivm::StoreOp>(innerOp))
+      auto enclosingScope = innerOp->getParentOfType<scope::ScopeOp>();
+      if (isa<hivm::CopyOp>(innerOp) ||
+          (isa<hivm::StoreOp>(innerOp) && enclosingScope &&
+           isVectorScope(enclosingScope)))
         ++counts.first;
-      else if (isa<hivm::FixpipeOp, hivm::MmadL1Op>(innerOp))
+      else if (isa<hivm::FixpipeOp>(innerOp) ||
+               (isa<hivm::MmadL1Op>(innerOp) && enclosingScope &&
+                isCubeScope(enclosingScope)))
         ++counts.second;
       return WalkResult::advance();
     });

@@ -117,7 +117,10 @@ def test_deprecated_simt_option_is_routed_once_during_in_place_normalization():
 
 
 def test_kirin9020_arch_capabilities():
-    assert utils.is_910_95_family_arch("Kirin9020")
+    assert utils.is_kirin_arch("Kirin9020")
+    assert utils.is_v310_arch("Kirin9020")
+    assert not utils.is_910_95_family_arch("Kirin9020")
+    assert utils.ub_size_in_kbytes_for_arch("Kirin9020") == 184
     assert not utils.is_simt_supported("Kirin9020")
     assert not utils.is_ffts_supported("Kirin9020")
     assert utils.is_simt_supported("Ascend910_9589")

@@ -37,7 +37,7 @@ namespace triton {
 std::unique_ptr<OperationPass<ModuleOp>> createTritonToStructuredPass();
 
 std::unique_ptr<OperationPass<ModuleOp>> createTritonToStructuredPass(
-    bool, bool, bool = false);
+    bool, bool, bool = true);
 
 } // namespace triton
 } // namespace mlir
@@ -52,7 +52,7 @@ public:
 
   TritonToStructuredPass(bool enableMaskFallbackConversion,
                          bool optimizeDynamicOffset,
-                         bool enablePackedLoadRewrite = false) {
+                         bool enablePackedLoadRewrite = true) {
     this->enableMaskFallbackConversion = enableMaskFallbackConversion;
     this->optimizeDynamicOffset = optimizeDynamicOffset;
     this->enablePackedLoadRewrite = enablePackedLoadRewrite;

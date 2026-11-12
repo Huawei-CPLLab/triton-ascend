@@ -49,6 +49,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/IR/Visitors.h"
@@ -747,9 +748,75 @@ LogicalResult MaskState::parseDiv(arith::DivSIOp divOp, const Location loc,
   return success();
 }
 
+static int64_t getMaskElemIntWidth(Type ty) {
+  Type elemTy = getElementTypeOrSelf(ty);
+  if (elemTy.isIndex())
+    return 64;
+  return elemTy.getIntOrFloatBitWidth();
+}
+
+static bool isKnownNonNegativeMaskInt(Value v, unsigned depth = 0) {
+  if (!v || depth > 8)
+    return false;
+  APInt apVal;
+  if (matchPattern(v, m_ConstantInt(&apVal)))
+    return !apVal.isNegative();
+  if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
+    if (auto dense = dyn_cast<DenseIntElementsAttr>(cst.getValue()))
+      return llvm::all_of(dense.getValues<APInt>(),
+                          [](const APInt &x) { return !x.isNegative(); });
+  }
+  if (auto range = v.getDefiningOp<triton::MakeRangeOp>())
+    return range.getStart() >= 0 && range.getEnd() >= range.getStart();
+  if (isa<triton::GetProgramIdOp, triton::GetNumProgramsOp>(v.getDefiningOp()))
+    return true;
+  if (auto bArg = dyn_cast<BlockArgument>(v)) {
+    if (auto forOp =
+            dyn_cast_or_null<scf::ForOp>(bArg.getOwner()->getParentOp())) {
+      if (bArg == forOp.getInductionVar()) {
+        APInt lb, step;
+        if (matchPattern(forOp.getLowerBound(), m_ConstantInt(&lb)) &&
+            matchPattern(forOp.getStep(), m_ConstantInt(&step)))
+          return !lb.isNegative() && !step.isNegative();
+      }
+    }
+    return false;
+  }
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (isa<arith::ExtUIOp, arith::IndexCastUIOp>(def))
+    return true;
+  if (isa<arith::ExtSIOp, arith::IndexCastOp, triton::SplatOp,
+          triton::ExpandDimsOp, triton::BroadcastOp>(def))
+    return isKnownNonNegativeMaskInt(def->getOperand(0), depth + 1);
+  if (auto shrui = dyn_cast<arith::ShRUIOp>(def)) {
+    APInt s;
+    int64_t bw = getMaskElemIntWidth(shrui.getType());
+    if (matchPattern(shrui.getRhs(), m_ConstantInt(&s)) &&
+        s.sgt(0) && s.slt(bw))
+      return true;
+    return isKnownNonNegativeMaskInt(shrui.getLhs(), depth + 1);
+  }
+  if (auto shrsi = dyn_cast<arith::ShRSIOp>(def))
+    return isKnownNonNegativeMaskInt(shrsi.getLhs(), depth + 1);
+  if (auto andOp = dyn_cast<arith::AndIOp>(def)) {
+    APInt m;
+    if ((matchPattern(andOp.getRhs(), m_ConstantInt(&m)) && !m.isNegative()) ||
+        (matchPattern(andOp.getLhs(), m_ConstantInt(&m)) && !m.isNegative()))
+      return true;
+    return isKnownNonNegativeMaskInt(andOp.getLhs(), depth + 1) &&
+           isKnownNonNegativeMaskInt(andOp.getRhs(), depth + 1);
+  }
+  if (isa<arith::AddIOp, arith::MulIOp>(def))
+    return isKnownNonNegativeMaskInt(def->getOperand(0), depth + 1) &&
+           isKnownNonNegativeMaskInt(def->getOperand(1), depth + 1);
+  return false;
+}
+
 LogicalResult MaskState::parseShR(Value lhs, Value rhs, const Location loc,
                                   OpBuilder &builder) {
-  if (!this->isEmpty()) {
+  if (!this->isEmpty() || !isKnownNonNegativeMaskInt(lhs)) {
     return failure();
   }
 
@@ -760,8 +827,11 @@ LogicalResult MaskState::parseShR(Value lhs, Value rhs, const Location loc,
   if (!rhsState.scalar)
     return failure();
 
+  int64_t maxShift =
+      std::min<int64_t>(getMaskElemIntWidth(lhs.getType()) - 1, 62);
   auto shiftInt = getIntAttr(rhsState.scalar);
-  if (!shiftInt.has_value() || shiftInt.value() < 0 || shiftInt.value() >= 64)
+  if (!shiftInt.has_value() || shiftInt.value() < 0 ||
+      shiftInt.value() >= maxShift)
     return failure();
 
   int64_t divisor = 1LL << shiftInt.value();

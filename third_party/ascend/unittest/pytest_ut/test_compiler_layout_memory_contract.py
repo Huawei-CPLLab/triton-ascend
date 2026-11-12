@@ -42,6 +42,8 @@ def _stub_ub_size_in_kbytes_for_arch(arch):
     """
     if not isinstance(arch, str) or not arch:
         return 0
+    if arch.lower().startswith("kirin"):
+        return 184
     if arch.startswith(("Ascend910_95", "Ascend950")):
         return 256
     if arch.startswith((
@@ -140,6 +142,13 @@ def compiler_module():
     utils_stub.get_cann_version_file_hash = lambda: ""
     utils_stub.graph_ub_budget_bytes_for_arch = _stub_graph_ub_budget_bytes_for_arch
     utils_stub.ub_size_in_kbytes_for_arch = _stub_ub_size_in_kbytes_for_arch
+    utils_stub.KIRIN_9020_ARCH = "Kirin9020"
+    utils_stub.is_kirin_arch = lambda arch: isinstance(arch, str) and arch.lower().startswith("kirin")
+    utils_stub.is_910_95_family_arch = lambda arch: isinstance(arch, str) and (
+        "ascend910_95" in arch.lower() or "ascend950" in arch.lower() or "910_958b" in arch.lower()
+    )
+    utils_stub.is_v310_arch = lambda arch: utils_stub.is_910_95_family_arch(arch) or utils_stub.is_kirin_arch(arch)
+    utils_stub.is_simt_supported = lambda arch: not utils_stub.is_kirin_arch(arch)
 
     class UnusedNPUUtils:
         pass

@@ -76,7 +76,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("pm"),
       py::arg("enable_mask_fallback_conversion"),
       py::arg("optimize_dynamic_offset"),
-      py::arg("enable_packed_load_rewrite") = false);
+      py::arg("enable_packed_load_rewrite") = true);
 
   m.def("add_triton_control_flow_opt", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTritonControlFlowOptPass());

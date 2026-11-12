@@ -262,7 +262,7 @@ def test_unknown_options_remain_available_for_jit_validation(backend):
 
 
 def test_kirin9020_uses_a5_path_without_simt():
-    backend = compiler.AscendBackend(GPUTarget(backend="npu", arch="Kirin9020"))
+    backend = compiler.AscendBackend(GPUTarget("npu", "Kirin9020", 32))
     options = backend.parse_options({})
 
     assert options.compile_on_910_95
@@ -270,6 +270,7 @@ def test_kirin9020_uses_a5_path_without_simt():
     assert not options.force_simt_template
     assert options.parallel_mode == "simd"
     assert options.compile_mode == "simd"
+    assert options.supported_fp8_dtypes == ()
 
     with pytest.raises(ValueError, match="not supported on Kirin9020"):
         backend.parse_options({"compile_mode": "simt_only"})
@@ -286,7 +287,21 @@ def test_kirin9020_uses_compact_to_tensor_syntax():
     assert compiler._normalize_to_tensor_syntax_for_target(explicit, "Kirin9020") == compact
     assert compiler._normalize_to_tensor_syntax_for_target(explicit, "Ascend910_9589") == explicit
 
+    strided = (
+        "%1 = bufferization.to_tensor %sub restrict "
+        ": memref<16x32xf16, strided<[64, 1], offset: ?>> to tensor<16x32xf16> loc(#loc1)\n")
+    strided_compact = (
+        "%1 = bufferization.to_tensor %sub restrict "
+        ": memref<16x32xf16, strided<[64, 1], offset: ?>> loc(#loc1)\n")
+    assert compiler._normalize_to_tensor_syntax_for_target(strided, "Kirin9020") == strided_compact
+
     # Do not erase a result type that cannot be inferred from the memref.
     mismatched = explicit.replace("tensor<?xf32>", "tensor<16xf32>")
     assert compiler._normalize_to_tensor_syntax_for_target(mismatched, "Kirin9020") == mismatched
+    encoded = explicit.replace("tensor<?xf32>", "tensor<?xf32, #enc>")
+    assert compiler._normalize_to_tensor_syntax_for_target(encoded, "Kirin9020") == encoded
+    commented = "// " + explicit
+    assert compiler._normalize_to_tensor_syntax_for_target(commented, "Kirin9020") == commented
+    in_loc = '#loc1 = loc("bufferization.to_tensor %x : memref<4xf16> to tensor<4xf16>":1:1)\n'
+    assert compiler._normalize_to_tensor_syntax_for_target(in_loc, "Kirin9020") == in_loc
 

@@ -350,11 +350,8 @@ static std::optional<RowCandidate> matchDotRows(triton::FuncOp fn) {
     if (auto store = dyn_cast<triton::StoreOp>(op)) {
       output = store;
       ++stores;
-      if (op->getBlock() != &fn.getBody().front()) {
-        auto module = fn->getParentOfType<ModuleOp>();
-        if (!module || !isKirinNPU(module))
-          safe = false;
-      }
+      if (op->getBlock() != &fn.getBody().front())
+        safe = false;
       return;
     }
 

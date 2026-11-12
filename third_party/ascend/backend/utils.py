@@ -284,29 +284,40 @@ def _warn_deprecated_ascend_env_vars() -> None:
 KIRIN_9020_ARCH = "Kirin9020"
 
 
+def is_kirin_arch(arch: str) -> bool:
+    """Return whether an architecture belongs to the Kirin NPU family."""
+    return isinstance(arch, str) and arch.lower().startswith("kirin")
+
+
 def is_910_95_family_arch(arch: str) -> bool:
-    """Return whether an architecture uses the 910_95/A5 compiler path."""
+    """Return whether an architecture belongs to the Ascend 910_95/950 family."""
+    if not isinstance(arch, str):
+        return False
     arch_lower = arch.lower()
-    return ("ascend910_95" in arch_lower or "ascend950" in arch_lower or "910_958b" in arch_lower
-            or arch_lower == KIRIN_9020_ARCH.lower())
+    return ("ascend910_95" in arch_lower or "ascend950" in arch_lower or "910_958b" in arch_lower)
+
+
+def is_v310_arch(arch: str) -> bool:
+    """Return whether an architecture uses the V310/A5 compiler pipeline."""
+    return is_910_95_family_arch(arch) or is_kirin_arch(arch)
 
 
 def is_simt_supported(arch: str) -> bool:
-    """Kirin9020 shares the A5 path but does not provide SIMT support."""
-    return arch.lower() != KIRIN_9020_ARCH.lower()
+    """Return whether the architecture provides hardware SIMT support."""
+    return not is_kirin_arch(arch)
 
 
 def is_compile_on_910_95(arch: str = None) -> bool:
-    """Return whether the compilation target belongs to the A5 generation."""
+    """Return whether the compilation target uses the V310/A5 compiler path."""
     if arch is not None:
-        return isinstance(arch, str) and is_910_95_family_arch(arch)
+        return isinstance(arch, str) and is_v310_arch(arch)
 
     global _is_compile_on_910_95
     if _is_compile_on_910_95 is None:
         try:
             import acl
             name = acl.get_soc_name()
-            _is_compile_on_910_95 = is_910_95_family_arch(name)
+            _is_compile_on_910_95 = is_v310_arch(name)
         except (ImportError, AttributeError):
             _is_compile_on_910_95 = False
     return _is_compile_on_910_95
@@ -802,6 +813,8 @@ def ub_size_in_kbytes_for_arch(arch: str) -> int:
     """
     if not isinstance(arch, str) or not arch:
         return 0
+    if is_kirin_arch(arch):
+        return 184
     if is_910_95_family_arch(arch):
         return 256
     if arch.startswith(("Ascend910A", "Ascend910B", "Ascend910D", "Ascend910_93", "Ascend310B")):

@@ -30,9 +30,11 @@ from typing import Optional, Dict, Any
 from .. import utils as runtime_utils
 
 
-def _arch_default(legacy_value: int, a5_value: int) -> int:
+def _arch_default(legacy_value: int, a5_value: int, kirin_value: Optional[int] = None) -> int:
     # Only called for an omitted constructor argument, never during import.
     arch = runtime_utils.target.arch
+    if arch.lower().startswith("kirin"):
+        return kirin_value if kirin_value is not None else legacy_value
     if arch.startswith(("Ascend910_95", "Ascend950")):
         return a5_value
     return legacy_value
@@ -57,15 +59,15 @@ class HardwareConstraints:
     """
 
     # Default ArchType : A2/A3
-    l0a_size: int = 64 * 1024  # 64 KB - for matrix A
-    l0b_size: int = 64 * 1024  # 64 KB - for matrix B
-    l0c_size: int = field(default_factory=lambda: _arch_default(128 * 1024, 256 * 1024))
+    l0a_size: int = field(default_factory=lambda: _arch_default(64 * 1024, 64 * 1024, 32 * 1024))
+    l0b_size: int = field(default_factory=lambda: _arch_default(64 * 1024, 64 * 1024, 32 * 1024))
+    l0c_size: int = field(default_factory=lambda: _arch_default(128 * 1024, 256 * 1024, 32 * 1024))
 
     # Memory limits (in bytes)
-    max_l0_size: int = 128 * 1024  # 128 KB
+    max_l0_size: int = field(default_factory=lambda: _arch_default(128 * 1024, 128 * 1024, 64 * 1024))
     max_l1_size: int = 512 * 1024  # 512 KB
-    max_l2_size: int = field(default_factory=lambda: _arch_default(192 * 1024 * 1024, 128 * 1024 * 1024))
-    ub_size: int = field(default_factory=lambda: _arch_default(192 * 1024, 248 * 1024))
+    max_l2_size: int = field(default_factory=lambda: _arch_default(192 * 1024 * 1024, 128 * 1024 * 1024, 8 * 1024 * 1024))
+    ub_size: int = field(default_factory=lambda: _arch_default(192 * 1024, 248 * 1024, 184 * 1024))
 
     def __post_init__(self):
         """Validate hardware constraints after initialization."""

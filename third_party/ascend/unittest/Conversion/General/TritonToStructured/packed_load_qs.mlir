@@ -133,11 +133,11 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @w3_qs_pair0
-// CHECK: tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32>
-// CHECK: tt.load
-// CHECK: tt.reshape
-// CHECK: tt.broadcast
-// CHECK: tt.reshape
+// CHECK: tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+// CHECK: tt.load {{.*}} : tensor<16x16x!tt.ptr<i8>>
+// CHECK: tt.expand_dims {{.*}} {axis = 2 : i32} : tensor<16x16xi8> -> tensor<16x16x1xi8>
+// CHECK: tt.broadcast {{.*}} : tensor<16x16x1xi8> -> tensor<16x16x8xi8>
+// CHECK: tt.reshape {{.*}} : tensor<16x16x8xi8> -> tensor<16x128xi8>
 
 // -----
 
@@ -180,8 +180,9 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @w3_qs_pair1
-// CHECK: tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32>
-// CHECK: tt.load
-// CHECK: tt.reshape
-// CHECK: tt.broadcast
-// CHECK: tt.reshape
+// CHECK: arith.constant dense<1> : tensor<16x16xi32>
+// CHECK: tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32>
+// CHECK: tt.load {{.*}} : tensor<16x16x!tt.ptr<i8>>
+// CHECK: tt.expand_dims {{.*}} {axis = 2 : i32} : tensor<16x16xi8> -> tensor<16x16x1xi8>
+// CHECK: tt.broadcast {{.*}} : tensor<16x16x1xi8> -> tensor<16x16x8xi8>
+// CHECK: tt.reshape {{.*}} : tensor<16x16x8xi8> -> tensor<16x128xi8>

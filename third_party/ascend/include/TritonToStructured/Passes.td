@@ -14,8 +14,8 @@ def TritonToStructured : Pass<"triton-to-structured", "mlir::ModuleOp"> {
             "bool", /*default*/"false",
             "Enable dynamic offset feature">,
         Option<"enablePackedLoadRewrite", "enable-packed-load-rewrite",
-            "bool", /*default*/"false",
-            "Rewrite proven repeated packed loads into compact loads">
+            "bool", /*default*/"true",
+            "Coalesce sub-element replicated tensor loads into compact loads">
     ];
 }
 

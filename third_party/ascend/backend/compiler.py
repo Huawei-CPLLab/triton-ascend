@@ -68,7 +68,9 @@ from triton.backends.ascend.utils import (
     ub_size_in_kbytes_for_arch,
     get_cann_version_file_hash,
     is_910_95_family_arch,
+    is_kirin_arch,
     is_simt_supported,
+    is_v310_arch,
     KIRIN_9020_ARCH,
 )
 from triton.backends.ascend.driver import (NPUUtils)
@@ -324,21 +326,107 @@ def make_ttir(mod, metadata, opt):
     return mod
 
 
-_TO_TENSOR_EXPLICIT_RESULT_RE = re.compile(
-    r"(bufferization\.to_tensor[^\n]*:\s*memref<([^,<>'\"\s]+)>)\s+to\s+tensor<\2>")
+_TO_TENSOR_PREFIX_RE = re.compile(r"bufferization\.to_tensor\b[^\n]*?:\s*memref<")
+
+
+def _extract_balanced_angle_body(text: str, open_angle_idx: int) -> Optional[Tuple[str, int]]:
+    """Return (inner_body, close_angle_idx) for `<...>` starting at open_angle_idx."""
+    if open_angle_idx >= len(text) or text[open_angle_idx] != "<":
+        return None
+    depth = 0
+    for idx in range(open_angle_idx, len(text)):
+        ch = text[idx]
+        if ch == "\n":
+            return None
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+            if depth == 0:
+                return text[open_angle_idx + 1:idx], idx
+    return None
+
+
+def _split_top_level_type_head(type_body: str) -> Tuple[str, bool]:
+    """Split `<shape-and-element-type, ...>` at the first depth-0 comma."""
+    depth = 0
+    for idx, ch in enumerate(type_body):
+        if ch in "<[(":
+            depth += 1
+        elif ch in ">])":
+            depth = max(depth - 1, 0)
+        elif ch == "," and depth == 0:
+            return type_body[:idx].strip(), True
+    return type_body.strip(), False
+
+
+def _is_inside_comment_or_string(text: str, pos: int) -> bool:
+    """Return True if ``pos`` falls inside a ``//`` comment or ``"..."`` string on its line."""
+    line_start = text.rfind("\n", 0, pos) + 1
+    in_quotes = False
+    escaped = False
+    idx = line_start
+    while idx < pos:
+        ch = text[idx]
+        if in_quotes:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_quotes = False
+        else:
+            if ch == '"':
+                in_quotes = True
+            elif ch == "/" and idx + 1 < pos and text[idx + 1] == "/":
+                return True
+        idx += 1
+    return in_quotes
 
 
 def _normalize_to_tensor_syntax_for_target(linalg: str, arch: str) -> str:
-    """Use the compact to_tensor syntax required by the Kirin middle end.
+    """Use the compact to_tensor syntax expected by the older MLIR parser in NPUIR.
 
-    Only remove an explicit tensor result type when it exactly matches the
-    shape and element type of a layout-free memref operand.  The result type is
-    therefore still inferred by MLIR and the operation's semantics are
-    unchanged.
+    Only remove an explicit `to tensor<...>` result clause when the tensor has no
+    encoding attribute and its shape + element type exactly match the memref
+    operand (including memrefs with strided layouts or memory-space annotations).
     """
-    if arch != KIRIN_9020_ARCH:
+    if not is_kirin_arch(arch):
         return linalg
-    return _TO_TENSOR_EXPLICIT_RESULT_RE.sub(r"\1", linalg)
+
+    out_parts = []
+    cursor = 0
+    for match in _TO_TENSOR_PREFIX_RE.finditer(linalg):
+        if _is_inside_comment_or_string(linalg, match.start()):
+            continue
+        memref_open_idx = match.end() - 1
+        memref_parsed = _extract_balanced_angle_body(linalg, memref_open_idx)
+        if memref_parsed is None:
+            continue
+        memref_body, memref_close_idx = memref_parsed
+
+        rest = linalg[memref_close_idx + 1:]
+        to_match = re.match(r"(\s+to\s+tensor)<", rest)
+        if to_match is None:
+            continue
+        tensor_open_idx = memref_close_idx + 1 + to_match.end() - 1
+        tensor_parsed = _extract_balanced_angle_body(linalg, tensor_open_idx)
+        if tensor_parsed is None:
+            continue
+        tensor_body, tensor_close_idx = tensor_parsed
+
+        memref_head, _ = _split_top_level_type_head(memref_body)
+        tensor_head, tensor_has_encoding = _split_top_level_type_head(tensor_body)
+        if tensor_has_encoding or memref_head != tensor_head:
+            continue
+
+        out_parts.append(linalg[cursor:memref_close_idx + 1])
+        cursor = tensor_close_idx + 1
+
+    if cursor == 0:
+        return linalg
+    out_parts.append(linalg[cursor:])
+    return "".join(out_parts)
 
 
 def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
@@ -366,16 +454,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         compile_on_910_95 = metadata["compile_on_910_95"]
         compile_mode = opt.compile_mode
         metadata["compile_mode"] = compile_mode
-        # This is a compiler option, not launch metadata. Reading only from
-        # metadata silently disabled the rewrite for normal kernel builds.
         enable_packed_load_rewrite = getattr(
-            opt, "enable_packed_load_rewrite", False
+            opt, "enable_packed_load_rewrite", True
         )
-        if opt.debug:
-            print(
-                "PackedLoadRewrite pipeline option: "
-                f"enable_packed_load_rewrite={enable_packed_load_rewrite}"
-            )
         enable_mixed_cv = metadata.get("enable_mixed_cv")
         disable_auto_inject_block_sync = metadata.get("disable_auto_inject_block_sync")
         set_workspace_multibuffer = metadata.get("set_workspace_multibuffer")
@@ -406,6 +487,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_llvm(pm)
         ascend.passes.ttir.add_bubble_up_operation(pm)
         ascend.passes.ttir.add_triton_to_structure(pm, False, False, enable_packed_load_rewrite)
+        ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, False, enable_select_analysis, compile_on_910_95,
                                                 compile_mode)
         # Restricted to 910_95/950. The merged buffer is written by two disjoint
@@ -758,7 +840,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         multibuffer = metadata.get("multibuffer")
         num_stages = metadata.get("num_stages")
 
-        if target_arch == KIRIN_9020_ARCH:
+        if is_kirin_arch(target_arch):
             multi_buffer_value = True
             if multibuffer is not None and not multibuffer:
                 multi_buffer_value = False
@@ -1219,10 +1301,10 @@ def _normalize_compile_mode(compile_mode, arch: str) -> str:
         raise ValueError(f"invalid compile_mode={compile_mode!r}; expected one of: " +
                          ", ".join(_CANONICAL_COMPILE_MODES))
 
-    if canonical_mode == "simt_only" and not _is_a5_target_arch(arch):
-        raise ValueError('compile_mode="simt_only" is supported only on A5 targets.')
     if canonical_mode == "simt_only" and not is_simt_supported(arch):
         raise ValueError(f"compile_mode='simt_only' is not supported on {arch}")
+    if canonical_mode == "simt_only" and not _is_a5_target_arch(arch):
+        raise ValueError('compile_mode="simt_only" is supported only on A5 targets.')
     return canonical_mode
 
 
@@ -1249,7 +1331,7 @@ class NPUOptions:
     # Deprecated constructor-only compatibility input.  The supplied value is
     # ignored and replaced with the lowering selector derived from GPUTarget.arch.
     compile_on_910_95: Optional[bool] = field(default=None, repr=False, kw_only=True)
-    enable_packed_load_rewrite: bool = False
+    enable_packed_load_rewrite: bool = True
     enable_warp_specialization: bool = False
     enable_persistent: bool = False
     optimize_epilogue: bool = False
@@ -1393,8 +1475,10 @@ class NPUOptions:
         object.__setattr__(
             self,
             "compile_on_910_95",
-            isinstance(arch, str) and is_910_95_family_arch(arch),
+            isinstance(arch, str) and is_v310_arch(arch),
         )
+        if is_kirin_arch(arch):
+            object.__setattr__(self, "supported_fp8_dtypes", ())
         try:
             normalized_rule_mask = normalize_graph_optimization_rule_mask(rule_mask)
         except ProgramGridContractError as error:
@@ -1453,7 +1537,7 @@ _INTERNAL_NPU_OPTION_MARKERS = frozenset({
 def _is_internal_npu_options(options, target_arch: str) -> bool:
     """Recognize an NPUOptions metadata round trip by backend-only fields."""
     return (_INTERNAL_NPU_OPTION_MARKERS <= options.keys() and options.get("target_arch") == target_arch
-            and options.get("compile_on_910_95") == _is_a5_target_arch(target_arch))
+            and options.get("compile_on_910_95") == is_v310_arch(target_arch))
 
 
 def _normalize_bishengir_simt_optimization_for_context(options: NPUOptions, raw_options) -> None:
@@ -1610,8 +1694,6 @@ class AscendBackend(BaseBackend):
                 object.__setattr__(options, "force_simt_template", False)
                 object.__setattr__(options, "parallel_mode", "simd")
                 object.__setattr__(options, "compile_mode", "simd")
-            if self.target.arch == KIRIN_9020_ARCH and "enable_packed_load_rewrite" not in opts:
-                object.__setattr__(options, "enable_packed_load_rewrite", True)
             if not internal_options:
                 _normalize_bishengir_simt_optimization_for_context(options, normalized_opts)
                 # Community JIT rejects the legacy launch keyword "stream"
