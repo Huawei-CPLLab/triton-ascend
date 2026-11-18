@@ -64,6 +64,26 @@ constexpr llvm::StringLiteral kCoalesceAxisAttr = "hacc.coalesce_axis";
 constexpr llvm::StringLiteral kCoalesceGridCeilDivAttr =
     "hacc.coalesce_grid_ceil_div";
 
+static bool isKirinTargetName(llvm::StringRef target) {
+  return target.equals_insensitive("kirin9020") ||
+         target.equals_insensitive("dav-l310") ||
+         target.equals_insensitive("l310");
+}
+
+static bool isKirinNPU(ModuleOp module) {
+  if (!module)
+    return false;
+  if (auto targetAttr =
+          module->getAttrOfType<hacc::TargetAttr>(hacc::TargetAttr::name))
+    return isKirinTargetName(targetAttr.getTarget());
+  for (llvm::StringRef attrName : {"hacc.target", "target"}) {
+    if (auto strAttr = module->getAttrOfType<StringAttr>(attrName))
+      if (isKirinTargetName(strAttr.getValue()))
+        return true;
+  }
+  return false;
+}
+
 static std::optional<int64_t> getConstantIntValue(Value v) {
   APInt value;
   if (matchPattern(v, m_ConstantInt(&value)))
@@ -201,14 +221,28 @@ static std::optional<RowAddressRange> analyzeRowAddress(Value v, Value pid) {
 }
 
 static int64_t chooseRowCoalescingFactor(int64_t grid, int64_t maxDotRows,
-                                         int64_t maxTensorBytes) {
+                                         int64_t maxTensorBytes,
+                                         ModuleOp module) {
   // Profitability policy, not a correctness requirement. Bound the widened M
   // dimension and the largest materialized value, including pointer tensors.
   // This is deliberately conservative, not a claim about peak live UB use or
   // an autotuned optimum. A known grid selects an exact factor; zero denotes
   // a runtime extent whose partial group is masked.
   constexpr int64_t targetDotRows = 128;
-  constexpr int64_t maxLiftedValueBytes = 128 * 1024;
+  int64_t maxLiftedValueBytes = 128 * 1024;
+  if (module) {
+    if (auto spec = hacc::utils::getNPUTargetSpec(module)) {
+      if (auto ubEntry = spec->getSpecForIdentifierEnum(hacc::DeviceSpec::UB_SIZE)) {
+        int64_t ubBytes = hacc::utils::getIntegerSpecValue(ubEntry) / 8;
+        if (ubBytes > 0 && ubBytes < 256 * 1024)
+          maxLiftedValueBytes = 64 * 1024;
+      }
+    } else if (isKirinNPU(module)) {
+      // The pinned AscendNPU-IR submodule predates Kirin9020Spec; apply the
+      // <256KB UB tier (64KB lifted-value cap) when targeting Kirin NPU.
+      maxLiftedValueBytes = 64 * 1024;
+    }
+  }
 
   for (int64_t factor : {32, 16, 8, 4, 2}) {
     if ((!grid || grid % factor == 0) && maxDotRows <= targetDotRows / factor &&
@@ -377,7 +411,7 @@ static std::optional<RowCandidate> matchDotRows(triton::FuncOp fn) {
     return std::nullopt;
 
   int64_t rows = chooseRowCoalescingFactor(grid ? grid.getInt() : 0, maxDotRows,
-                                           maxTensorBytes);
+                                           maxTensorBytes, module);
   if (rows <= 1)
     return std::nullopt;
 
@@ -806,9 +840,9 @@ public:
 
 std::unique_ptr<RewritePlan>
 cfg::createDotRowCoalescingPlan(triton::FuncOp function, unsigned epoch) {
-  // Dot row coalescing is supported only on A5 (Ascend950).
+  // Dot row coalescing is supported on A5 (Ascend950) and Kirin9020 (dav-l310).
   auto module = function->getParentOfType<ModuleOp>();
-  if (!module || !hacc::utils::isAscend950(module))
+  if (!module || (!hacc::utils::isAscend950(module) && !isKirinNPU(module)))
     return nullptr;
 
   auto candidate = matchDotRows(function);
