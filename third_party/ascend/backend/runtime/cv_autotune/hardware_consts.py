@@ -67,7 +67,7 @@ class HardwareConstraints:
     max_l0_size: int = field(default_factory=lambda: _arch_default(128 * 1024, 128 * 1024, 64 * 1024))
     max_l1_size: int = 512 * 1024  # 512 KB
     max_l2_size: int = field(default_factory=lambda: _arch_default(192 * 1024 * 1024, 128 * 1024 * 1024, 8 * 1024 * 1024))
-    ub_size: int = field(default_factory=lambda: _arch_default(192 * 1024, 248 * 1024, 184 * 1024))
+    ub_size: int = field(default_factory=lambda: _arch_default(192 * 1024, 248 * 1024, 120 * 1024))
 
     def __post_init__(self):
         """Validate hardware constraints after initialization."""

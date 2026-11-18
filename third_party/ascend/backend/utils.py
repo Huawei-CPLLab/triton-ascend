@@ -814,7 +814,7 @@ def ub_size_in_kbytes_for_arch(arch: str) -> int:
     if not isinstance(arch, str) or not arch:
         return 0
     if is_kirin_arch(arch):
-        return 184
+        return 120
     if is_910_95_family_arch(arch):
         return 256
     if arch.startswith(("Ascend910A", "Ascend910B", "Ascend910D", "Ascend910_93", "Ascend310B")):

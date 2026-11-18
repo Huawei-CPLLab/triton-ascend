@@ -43,7 +43,7 @@ def _stub_ub_size_in_kbytes_for_arch(arch):
     if not isinstance(arch, str) or not arch:
         return 0
     if arch.lower().startswith("kirin"):
-        return 184
+        return 120
     if arch.startswith(("Ascend910_95", "Ascend950")):
         return 256
     if arch.startswith((
