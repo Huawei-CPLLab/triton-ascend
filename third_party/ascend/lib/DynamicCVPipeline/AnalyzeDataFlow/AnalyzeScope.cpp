@@ -55,6 +55,15 @@ static bool isVectorScope(scope::ScopeOp scopeOp) {
   return coreTypeAttr.getTcoretype() == hivm::TCoreType::VECTOR;
 }
 
+static bool isCubeScope(scope::ScopeOp scopeOp) {
+  auto coreTypeAttr =
+      scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(hivm::TCoreTypeAttr::name);
+  if (!coreTypeAttr) {
+    return false;
+  }
+  return coreTypeAttr.getTcoretype() == hivm::TCoreType::CUBE;
+}
+
 static bool checkTransferInteraction(mlir::Operation *op) {
   bool hasCVInteraction = false;
   // check v->c data interaction
@@ -135,17 +144,35 @@ static bool checkVecScopeMainLoop(ModuleOp module) {
   return hasMainLoop && allMainLoopsSatisfy;
 }
 
+static bool isFixpipeToUB(Operation *op) {
+  auto fixpipeOp = dyn_cast<hivm::FixpipeOp>(op);
+  if (!fixpipeOp)
+    return false;
+  auto dstType = dyn_cast<MemRefType>(fixpipeOp.getDst().getType());
+  if (!dstType)
+    return false;
+  auto addrSpaceAttr =
+      dyn_cast_or_null<hivm::AddressSpaceAttr>(dstType.getMemorySpace());
+  if (!addrSpaceAttr)
+    return false;
+
+  return addrSpaceAttr.getAddressSpace() == hivm::AddressSpace::UB;
+}
+
 // For every main_loop id, gather all for/while ops sharing that id and count
-// the hivm.hir.copy and hivm.hir.fixpipe ops within them. Only when ALL
-// main_loop ids have either count equal to zero (every id has only copy or
-// only fixpipe, none has both), the dynamic CV pipeline cannot be applied and
-// we fall back to the original workflow.
+// the hivm.hir.copy ops and the hivm.hir.fixpipe ops writing to UB within
+// them. Only when ALL main_loop ids have either count equal to zero (every id
+// has only copy or only fixpipe, none has both), the dynamic CV pipeline
+// cannot be applied and we fall back to the original workflow.
 //   - hivm::CopyOp    typically appears in VECTOR scope main_loops
 //   - hivm::FixpipeOp typically appears in CUBE scope main_loops
 // Nested regions inside the main_loop op are also walked, and scf.yield
 // terminators are skipped.
 static bool isMainLoopOnlyCopyOrFixpipe(ModuleOp module) {
-  // main_loop id -> (countCopy, countFixpipe)
+  // main_loop id -> (countVecComm, countCubeComm)
+  // Include Vector StoreOp and Cube MmadL1Op alongside CopyOp and UB FixpipeOp
+  // so reduction main loops whose FixpipeOp sits outside the loop are
+  // recognized as valid bidirectional CV loops.
   llvm::DenseMap<int, std::pair<int, int>> idToCounts;
 
   module.walk([&](Operation *op) -> WalkResult {
@@ -161,17 +188,17 @@ static bool isMainLoopOnlyCopyOrFixpipe(ModuleOp module) {
     auto &counts = idToCounts[id];
 
     op->walk([&](mlir::Operation *innerOp) -> WalkResult {
-      // Skip the loop op itself (the walk visits it first)
-      if (innerOp == op) {
+      if (innerOp == op || isa<scf::YieldOp>(innerOp)) {
         return WalkResult::advance();
       }
-      // Skip yield terminators (they are not real ops)
-      if (isa<scf::YieldOp>(innerOp)) {
-        return WalkResult::advance();
-      }
-      if (isa<hivm::CopyOp>(innerOp)) {
+      auto enclosingScope = innerOp->getParentOfType<scope::ScopeOp>();
+      if (isa<hivm::CopyOp>(innerOp) ||
+          (isa<hivm::StoreOp>(innerOp) && enclosingScope &&
+           isVectorScope(enclosingScope))) {
         ++counts.first;
-      } else if (isa<hivm::FixpipeOp>(innerOp)) {
+      } else if (isFixpipeToUB(innerOp) ||
+                 (isa<hivm::MmadL1Op>(innerOp) && enclosingScope &&
+                  isCubeScope(enclosingScope))) {
         ++counts.second;
       }
       return WalkResult::advance();

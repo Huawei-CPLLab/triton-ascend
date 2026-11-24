@@ -27,6 +27,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include <optional>
@@ -88,6 +89,24 @@ public:
         return MaskPosition::Unknown;
       }
     }
+    // A tail reaches the end of the only dimension with a nonzero start.
+    // parseCmp(sge) represents its dynamic size as extent - offset. Recognize
+    // that form without creating IR; other intervals remain Middle.
+    auto offset = offsets[dynIndex];
+    auto size = dims[dynIndex];
+    int64_t extent = tensorShape[dynIndex];
+    auto constantOffset = mlir::getConstantIntValue(offset);
+    auto constantSize = mlir::getConstantIntValue(size);
+    if (constantOffset && constantSize && *constantOffset >= 0 &&
+        *constantOffset <= extent && *constantSize == extent - *constantOffset)
+      return MaskPosition::Tail;
+    if (auto sizeValue = mlir::dyn_cast<mlir::Value>(size)) {
+      if (auto sub = sizeValue.getDefiningOp<mlir::arith::SubIOp>()) {
+        if (mlir::isConstantIntValue(sub.getLhs(), extent) &&
+            mlir::isEqualConstantIntOrValue(sub.getRhs(), offset))
+          return MaskPosition::Tail;
+      }
+    }
     return MaskPosition::Middle;
   }
 
@@ -132,6 +151,14 @@ private:
   LogicalResult addStates(const MaskState &lhsState, const MaskState &rhsState,
                           const Location &loc, OpBuilder &builder);
 
+  LogicalResult subStateScalar(const MaskState &state,
+                               const OpFoldResult scalar, const Location &loc,
+                               OpBuilder &builder);
+
+  // Only supports (range - scalar).
+  LogicalResult subStates(const MaskState &lhsState, const MaskState &rhsState,
+                          const Location &loc, OpBuilder &builder);
+
   LogicalResult divStateScalar(const MaskState &state,
                                const OpFoldResult scalar, const Location &loc,
                                OpBuilder &builder);
@@ -158,6 +185,10 @@ private:
 
   // TODO
   LogicalResult parseAdd(arith::AddIOp addOp, const Location &loc,
+                         OpBuilder &builder);
+
+  // Operand is the result of subi (range - scalar).
+  LogicalResult parseSub(arith::SubIOp subOp, const Location &loc,
                          OpBuilder &builder);
 
   // operand is the result of divsi
@@ -197,6 +228,19 @@ private:
   LogicalResult parseInsert(tensor::InsertOp insertOp, const Location &loc,
                             OpBuilder &builder);
 };
+
+struct MaskDecomposition {
+  // AND of all leaves that MaskState::parse() can analyze as a rectangle mask.
+  // nullptr when no such leaves exist.
+  Value contMask;
+  // AND of all leaves that MaskState::parse() cannot analyze
+  // (discrete/runtime). nullptr when no such leaves exist.
+  Value discMask;
+};
+
+MaskDecomposition decomposeAndMask(Operation *op, Value mask,
+                                   const Location &loc,
+                                   PatternRewriter &rewriter);
 
 std::optional<MaskState> runMaskAnalysis(Operation *op, OpBuilder &builder);
 

@@ -26,6 +26,7 @@ from typing import Optional
 import fnmatch
 
 import triton.runtime as runtime
+from triton import knobs
 from triton.knobs import cache
 
 
@@ -265,13 +266,16 @@ def do_bench_npu_mspti(
 
     if clear_l2_cache:
         buffer = runtime.driver.active.get_empty_cache_for_benchmark()
+        buffer = buffer.float()  # to avoid type cast
+        buffer.sum()
+        torch.npu.synchronize()  # shake out of any npu error
     else:
         buffer = None
 
     all_kernel_durations = []
 
     def callback(data):
-        if clear_l2_cache and ('zero' in data.name.lower() or 'zeroslike' in data.name.lower()):
+        if clear_l2_cache and ('reducesum' in data.name.lower()):
             return
         if target_kernel_name is not None and target_kernel_name not in data.name:
             return
@@ -287,8 +291,10 @@ def do_bench_npu_mspti(
         for fn in funcs:
             for _ in builtins.range(total):
                 if clear_l2_cache:
-                    buffer.zero_()
+                    buffer.sum()
+                    torch.npu.synchronize()
                 fn()
+                torch.npu.synchronize()
     finally:
         torch.npu.synchronize()
         monitor.stop()
@@ -379,7 +385,7 @@ def do_bench_npu(
         funcs = [funcs]
         use_autotune = False
     else:
-        use_autotune = os.getenv("TRITON_BENCH_METHOD", "default").lower() == "npu"
+        use_autotune = knobs.ascend.bench_method.lower() == "npu"
 
     results = None
     need_fallback = True

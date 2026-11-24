@@ -21,6 +21,7 @@
  */
 
 #include "TritonToStructured/TritonToStructuredPass.h"
+#include "TritonToStructured/PackedLoadRewrite.h"
 
 #include <cassert>
 #include <cstdint>
@@ -54,6 +55,7 @@
 #include "mlir/Transforms/Passes.h"
 
 #include "TritonToStructured/CannonicalizerConverter.h"
+#include "TritonToStructured/ImplicitPermute.h"
 #include "TritonToStructured/MemOpConverter.h"
 #include "TritonToStructured/PtrAnalysis.h"
 #include "llvm/ADT/BitVector.h"
@@ -114,6 +116,43 @@ void TritonToStructuredPass::populateTritonToStructuredPatterns(
                                                enableMaskFallbackConversion);
 }
 
+static bool moduleHasCubeOps(ModuleOp moduleOp) {
+  bool existDot = false;
+  moduleOp.walk([&](Operation *op) {
+    if (isa<triton::DotOp, triton::DotScaledOp>(op)) {
+      existDot = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return existDot;
+}
+
+LogicalResult
+TritonToStructuredPass::processImplicitPermuteOperations(ModuleOp moduleOp) {
+  // Same early-exit inputs as the former Linalg globals:
+  //   if (compileOn91095Flag && !existDotFlag) skip load permute.
+  bool existDotFlag = moduleHasCubeOps(moduleOp);
+  mlir::RewritePatternSet patterns(&getContext());
+  patterns.add<ImplicitPermute::LoadConverter>(
+      patterns.getContext(), /*compileOn91095Flag=*/compileOn91095,
+      /*existDotFlag=*/existDotFlag);
+  patterns.add<ImplicitPermute::StoreConverter>(patterns.getContext());
+  patterns.add<ImplicitPermute::AtomicRMWConverter>(patterns.getContext());
+  patterns.add<ImplicitPermute::AtomicCASConverter>(patterns.getContext());
+  patterns.add<CannonicalizerConverter::SplatCmpConverter>(
+      patterns.getContext());
+
+  if (failed(applyPatternsGreedily(moduleOp, std::move(patterns)))) {
+    LLVM_DEBUG({ llvm::dbgs() << "ImplicitPermute: rewrite MemOp failed\n"; });
+  }
+
+  mlir::PassManager pm(&getContext(), moduleOp.getOperationName());
+  pm.addPass(createCSEPass());
+  pm.addPass(createCanonicalizerPass());
+  return runPipeline(pm, getOperation());
+}
+
 LogicalResult
 TritonToStructuredPass::processSplatBinaryOperations(ModuleOp moduleOp) {
   mlir::RewritePatternSet patterns(&getContext());
@@ -128,8 +167,14 @@ TritonToStructuredPass::processSplatBinaryOperations(ModuleOp moduleOp) {
 
 void TritonToStructuredPass::runOnOperation() {
   auto moduleOp = getOperation();
-  ConversionTarget target(getContext());
   RewritePatternSet canonicalizerPatterns(&getContext());
+
+  if (enablePackedLoadRewrite) {
+    RewritePatternSet coalescePatterns(&getContext());
+    coalescePatterns.add<SubElementLoadCoalesce>(&getContext());
+    if (failed(applyPatternsGreedily(moduleOp, std::move(coalescePatterns))))
+      moduleOp.emitWarning("SubElementLoadCoalesce failed");
+  }
 
   this->populateTritonToStructuredCanonicalizationPatterns(
       canonicalizerPatterns);
@@ -143,9 +188,23 @@ void TritonToStructuredPass::runOnOperation() {
                                      optimizeDynamicOffset,
                                      enableMaskFallbackConversion);
 
-  if (failed(applyPatternsGreedily(moduleOp,
-                                   std::move(tritonToStructuredPatterns)))) {
+  // Seed the worklist with memory ops while keeping newly generated operations
+  // eligible for rewriting, including loads/stores created by cat splitting.
+  SmallVector<Operation *> memoryOps;
+  moduleOp.walk([&](Operation *op) {
+    if (isa<triton::LoadOp, triton::StoreOp>(op))
+      memoryOps.push_back(op);
+  });
+  FrozenRewritePatternSet memoryPatterns(std::move(tritonToStructuredPatterns));
+  if (failed(applyOpPatternsGreedily(memoryOps, memoryPatterns))) {
     LLVM_DEBUG({ moduleOp->emitRemark("PtrAnalysis: rewrite MemOp failed"); });
+  }
+
+  if (failed(processImplicitPermuteOperations(moduleOp))) {
+    LLVM_DEBUG(
+        { llvm::dbgs() << "Failed to process implicit permute operations\n"; });
+    signalPassFailure();
+    return;
   }
 
   if (failed(processSplatBinaryOperations(moduleOp))) {
@@ -167,7 +226,10 @@ triton::createTritonToStructuredPass() {
 
 std::unique_ptr<OperationPass<ModuleOp>>
 triton::createTritonToStructuredPass(bool enableMaskFallbackConversion,
-                                     bool optimizeDynamicOffset) {
-  return std::make_unique<TritonToStructuredPass>(enableMaskFallbackConversion,
-                                                  optimizeDynamicOffset);
+                                     bool optimizeDynamicOffset,
+                                     bool compileOn91095,
+                                     bool enablePackedLoadRewrite) {
+  return std::make_unique<TritonToStructuredPass>(
+      enableMaskFallbackConversion, optimizeDynamicOffset, compileOn91095,
+      enablePackedLoadRewrite);
 }

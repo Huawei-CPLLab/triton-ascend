@@ -17,8 +17,10 @@ The installed Triton package can point at another worktree, so importing
 being changed here.
 """
 
+import ast
 import importlib.util
 import itertools
+import json
 import sys
 import types
 import warnings
@@ -42,6 +44,8 @@ def _stub_ub_size_in_kbytes_for_arch(arch):
     """
     if not isinstance(arch, str) or not arch:
         return 0
+    if arch.lower().startswith("kirin"):
+        return 120
     if arch.startswith(("Ascend910_95", "Ascend950")):
         return 256
     if arch.startswith((
@@ -57,6 +61,22 @@ def _stub_ub_size_in_kbytes_for_arch(arch):
 
 def _stub_graph_ub_budget_bytes_for_arch(arch):
     return _stub_ub_size_in_kbytes_for_arch(arch) * 1024 * 80 // 100
+
+
+def _stub_l0_size_in_kbytes_for_arch(arch):
+    if isinstance(arch, str) and arch.lower().startswith("kirin"):
+        return (32, 32, 32)
+    if arch.startswith(("Ascend910_95", "Ascend950")):
+        return (64, 64, 256)
+    if arch.startswith((
+            "Ascend910A",
+            "Ascend910B",
+            "Ascend910D",
+            "Ascend910_93",
+            "Ascend310B",
+    )):
+        return (64, 64, 128)
+    return (0, 0, 0)
 
 
 class _FakeModule:
@@ -108,6 +128,11 @@ def compiler_module():
         return normalized
 
     utils_stub = types.ModuleType(utils_name)
+    utils_path = compiler_path.with_name("utils.py")
+    utils_tree = ast.parse(utils_path.read_text())
+    mode_helper = next(node for node in utils_tree.body
+                       if isinstance(node, ast.FunctionDef) and node.name == "_multibuffer_mode_to_tuple")
+    exec(compile(ast.Module(body=[mode_helper], type_ignores=[]), str(utils_path), "exec"), utils_stub.__dict__)
     for name in (
             "_check_bishengir_api_change",
             "_check_bishengir_able_save_ir",
@@ -119,14 +144,13 @@ def compiler_module():
             "_is_debug_line_info_disabled",
             "_is_auto_map_parallel_blocks_enabled",
             "force_disable_ffts",
+            "is_cann_version_at_least",
     ):
         setattr(utils_stub, name, return_false)
     for name in (
             "_get_kernel_target",
             "_get_triton_adapter_opt_path",
-            "_get_triton_mlir_opt_path",
             "_get_triton_opt_path",
-            "_get_bishengir_opt_path",
     ):
         setattr(utils_stub, name, lambda *_args, **_kwargs: "")
     utils_stub._get_npucompiler_path = lambda *_args, **_kwargs: ("", {})
@@ -140,6 +164,14 @@ def compiler_module():
     utils_stub.get_cann_version_file_hash = lambda: ""
     utils_stub.graph_ub_budget_bytes_for_arch = _stub_graph_ub_budget_bytes_for_arch
     utils_stub.ub_size_in_kbytes_for_arch = _stub_ub_size_in_kbytes_for_arch
+    utils_stub.l0_size_in_kbytes_for_arch = _stub_l0_size_in_kbytes_for_arch
+    utils_stub.KIRIN_9020_ARCH = "Kirin9020"
+    utils_stub.is_kirin_arch = lambda arch: isinstance(arch, str) and arch.lower().startswith("kirin")
+    utils_stub.is_910_95_family_arch = lambda arch: isinstance(arch, str) and (
+        "ascend910_95" in arch.lower() or "ascend950" in arch.lower() or "910_958b" in arch.lower()
+    )
+    utils_stub.is_v310_arch = lambda arch: utils_stub.is_910_95_family_arch(arch) or utils_stub.is_kirin_arch(arch)
+    utils_stub.is_simt_supported = lambda arch: not utils_stub.is_kirin_arch(arch)
 
     class UnusedNPUUtils:
         pass
@@ -149,8 +181,12 @@ def compiler_module():
 
     cache_stub = types.ModuleType(cache_name)
     cache_stub._base32 = lambda value: str(value)
-    cache_stub.get_dump_manager = lambda *_args, **_kwargs: SimpleNamespace(cache_dir="", put=lambda *_args, **_kwargs:
-                                                                            None)
+    dump_dir = Path("/fake/dump")
+    cache_stub.get_dump_manager = lambda *_args, **_kwargs: SimpleNamespace(
+        cache_dir=str(dump_dir),
+        _make_path=lambda filename: str(dump_dir / filename),
+        put=lambda *_args, **_kwargs: None,
+    )
 
     # Initialize the installed Triton package before temporarily replacing its
     # cache module below.  Loading compiler.py starts from triton._C; doing it
@@ -198,7 +234,96 @@ def compiler_module():
             sys.modules.pop(cache_name, None)
         else:
             sys.modules[cache_name] = previous_cache
+    # Command-construction tests use fake compiler paths. Capability discovery
+    # is tested independently; keep these cases focused on emitted options.
     return module
+
+
+@pytest.mark.parametrize("arch",
+                         ["Ascend950PR_9579", "Ascend950DT_9579", "Ascend910_9581", "Ascend910B4", "Ascend910_9363"])
+@pytest.mark.parametrize("device_limit", [None, "14,28", "bad-limit"])
+@pytest.mark.parametrize("pure_simt", [False, True])
+def test_npuir_device_options(compiler_module, monkeypatch, arch, device_limit, pure_simt):
+    compiler = compiler_module
+    driver_path = Path(__file__).resolve().parents[2] / "backend" / "driver.py"
+    driver_class = next(node for node in ast.parse(driver_path.read_text()).body
+                        if isinstance(node, ast.ClassDef) and node.name == "NPUUtils")
+    namespace = {name: importlib.import_module(name) for name in ("functools", "os", "re")}
+    namespace["_NPU_DEVICE_LIMIT_REGEX"] = namespace["re"].compile(r'^\d+ *, *\d+$')
+    exec(compile(ast.Module(body=[driver_class], type_ignores=[]), str(driver_path), "exec"), namespace)
+    npu_utils = object.__new__(namespace["NPUUtils"])
+    npu_utils.get_device_core = lambda: (28, 56)
+    npu_utils.get_arch = lambda: arch
+    monkeypatch.setattr(compiler, "NPUUtils", lambda: npu_utils)
+    if device_limit is None:
+        monkeypatch.delenv("NPU_DEVICE_LIMIT", raising=False)
+    else:
+        monkeypatch.setenv("NPU_DEVICE_LIMIT", device_limit)
+
+    expected_cores = (14, 28) if device_limit == "14,28" else (28, 56)
+    assert npu_utils.get_device_core() == (28, 56)
+    if device_limit == "bad-limit":
+        with pytest.raises(ValueError):
+            npu_utils.get_aicore_num()
+        assert npu_utils.get_device_limit() == (False, 28, 56)
+    else:
+        assert (npu_utils.get_aicore_num(), npu_utils.get_aivector_core_num()) == expected_cores
+
+    options = _parse_options(compiler, arch)
+    metadata = dict(options.__dict__, target=SimpleNamespace(arch=arch), hash="device-info-test", mix_mode="aiv",
+                    bitcodes=None, auto_blockify_enabled=False)
+    monkeypatch.setattr(compiler, "_parse_linalg_metadata", lambda source, meta: (source, meta))
+    monkeypatch.setattr(compiler, "_parse_ttir_metadata", lambda _source, meta: meta)
+    monkeypatch.setattr(compiler, "_export_program_grid_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(compiler, "_finalize_program_launch_policy", lambda *_args: None)
+    monkeypatch.setattr(compiler, "_get_npucompiler_path", lambda: ("/fake/compiler", {}))
+    monkeypatch.setattr(compiler, "get_simt_stack_limit", lambda: 1152)
+    monkeypatch.delenv("TRITON_ENABLE_LIBDEVICE", raising=False)
+
+    commands = []
+
+    class CommandCaptured(Exception):
+        pass
+
+    def capture(command, **_kwargs):
+        commands.append(command)
+        raise CommandCaptured
+
+    monkeypatch.setattr(compiler.subprocess, "run", capture)
+    if pure_simt:
+        options = SimpleNamespace(**{**options.__dict__, "is_pure_simt": True})
+        compile_fn = compiler.ttir_to_npubin
+    else:
+        compile_fn = (compiler.linalg_to_bin_enable_npu_compile_910_95
+                      if options.compile_on_910_95 else compiler.linalg_to_bin_enable_npu_compile_A2_A3)
+    with pytest.raises(CommandCaptured):
+        compile_fn("module {}", metadata, options)
+
+    is_a5 = arch.startswith(("Ascend950", "Ascend910_95"))
+    expected = [f"--target={'Ascend950' if is_a5 else arch}"]
+    if is_a5:
+        aic, aiv = expected_cores
+        expected += [f"--custom-aic-number={aic}", f"--custom-aiv-number={aiv}"]
+    assert len(commands) == 1
+    assert [
+        arg for arg in commands[0] if arg.startswith(("--target=", "--custom-aic-number=", "--custom-aiv-number="))
+    ] == expected
+
+    # The parent resolves the existing device/config policy; lowering consumes
+    # exactly the same inputs without re-entering the runtime in the worker.
+    cores = compiler._graph_optimize_core_num(options)
+    assert cores == (0 if device_limit == "bad-limit" else expected_cores[int(pure_simt)])
+    context = (arch, cores, npu_utils.get_device_limit() if options.compile_on_910_95 else None,
+               1152 if pure_simt else None)
+    captured = SimpleNamespace(**{**options.__dict__, "block_compile_context": context})
+    monkeypatch.setattr(compiler, "NPUUtils", lambda: pytest.fail("worker queried device limits"))
+    monkeypatch.setattr(compiler, "get_simt_stack_limit", lambda: pytest.fail("worker reopened runtime config"))
+    assert compiler._graph_optimize_core_num(captured) == cores
+    with pytest.raises(CommandCaptured):
+        compile_fn("module {}", metadata, captured)
+    # Input/output paths are private for each compile; all flags must match.
+    flags = lambda command: [arg for arg in command if arg.startswith("--")]
+    assert flags(commands[0]) == flags(commands[1])
 
 
 def _parse_options(compiler, arch, opts=None):
@@ -206,7 +331,7 @@ def _parse_options(compiler, arch, opts=None):
     return backend.parse_options({} if opts is None else opts)
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 @pytest.mark.parametrize(
     ("arch", "requested_capacity", "expected_capacity"),
     (
@@ -232,7 +357,7 @@ def test_npu_options_normalizes_graph_ub_budget(compiler_module, arch, requested
     assert options.graph_optimize_ub_capacity_bytes == expected_capacity
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 @pytest.mark.parametrize(
     ("arch", "requested_capacity", "expected_capacity"),
     (
@@ -257,7 +382,7 @@ def test_parse_options_normalizes_graph_ub_budget(compiler_module, arch, request
     assert options.graph_optimize_ub_capacity_bytes == expected_capacity
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 def test_normalized_graph_ub_budget_contributes_to_npu_hash(compiler_module):
     auto = compiler_module.NPUOptions(arch="Ascend910B1")
     explicit_none = compiler_module.NPUOptions(arch="Ascend910B1", graph_optimize_ub_capacity_bytes=None)
@@ -274,7 +399,7 @@ def test_normalized_graph_ub_budget_contributes_to_npu_hash(compiler_module):
     assert auto.hash() != small.hash()
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 @pytest.mark.parametrize(
     ("requested_capacity", "error_type"),
     (
@@ -296,7 +421,6 @@ def _make_opt(
     is_pure_simt,
     superblock_factor=0,
     simt_optimization_mode=0,
-    simt_stack_limit=None,
     shared_mem_dynamic_size=None,
     disable_fma=False,
     compile_on_910_95=False,
@@ -306,7 +430,6 @@ def _make_opt(
         num_warps=4,
         warp_size=32,
         simt_optimization_mode=simt_optimization_mode,
-        simt_stack_limit=simt_stack_limit,
         shared_mem_dynamic_size=shared_mem_dynamic_size,
         disable_fma=disable_fma,
         superblock_factor=superblock_factor,
@@ -336,7 +459,6 @@ def _run_ttir_to_npubin(
     superblock_factor=0,
     common_options=(),
     simt_optimization_mode=0,
-    simt_stack_limit=None,
     resolved_simt_stack_limit=1152,
     shared_mem_dynamic_size=None,
     disable_fma=False,
@@ -384,10 +506,9 @@ def _run_ttir_to_npubin(
     )
 
     # Keep this argv matrix independent of the host torch_npu configuration
-    # while checking that Pure-SIMT passes the explicit option to the resolver.
-    def get_simt_stack_limit(user_stack_limit):
-        assert user_stack_limit == simt_stack_limit
-        return resolved_simt_stack_limit if user_stack_limit is None else user_stack_limit
+    # while checking that Pure-SIMT uses the backend-resolved stack limit.
+    def get_simt_stack_limit():
+        return resolved_simt_stack_limit
 
     monkeypatch.setattr(compiler, "get_simt_stack_limit", get_simt_stack_limit)
     monkeypatch.setattr(compiler.subprocess, "run", run_bisheng)
@@ -399,7 +520,6 @@ def _run_ttir_to_npubin(
             is_pure_simt=is_pure_simt,
             superblock_factor=superblock_factor,
             simt_optimization_mode=simt_optimization_mode,
-            simt_stack_limit=simt_stack_limit,
             shared_mem_dynamic_size=shared_mem_dynamic_size,
             disable_fma=disable_fma,
         ),
@@ -409,10 +529,18 @@ def _run_ttir_to_npubin(
     return events, commands[0]
 
 
+def test_simt_stack_limit_is_not_a_compile_option(compiler_module):
+    assert "simt_stack_limit" not in compiler_module.NPUOptions.__dataclass_fields__
+    assert "simt_stack_limit" not in _parse_options(compiler_module, "Ascend910_9581").__dict__
+    with pytest.raises(TypeError, match="simt_stack_limit"):
+        compiler_module.NPUOptions(arch="Ascend910_9581", simt_stack_limit=8192)
+
+
 def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op):
     commands = []
     parsed_metadata = defaultdict(
         lambda: None, {
+            "hash": "layout-memory-contract-test",
             "target": SimpleNamespace(arch="Ascend910B"),
             "program_grid_transforms": None,
             "program_grid_mapping_applied": False,
@@ -425,8 +553,8 @@ def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op
 
     class FakeNPUUtils:
 
-        def has_device_limit(self):
-            return False
+        def get_device_limit(self):
+            return False, None, None
 
         def get_arch(self):
             return "Ascend910B"
@@ -457,7 +585,7 @@ def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op
     return commands[0]
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 def test_export_coalesce_metadata_removes_attrs_and_marks_row(compiler_module, monkeypatch):
     removed = []
 
@@ -509,7 +637,7 @@ def test_export_coalesce_metadata_removes_attrs_and_marks_row(compiler_module, m
     }
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 def test_export_coalesce_metadata_rejects_partial_row_contract(compiler_module, monkeypatch):
 
     def get_int_attr(module, name):
@@ -545,7 +673,7 @@ def test_export_coalesce_metadata_rejects_partial_row_contract(compiler_module, 
         )
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 def test_ttir_to_npubin_exports_make_ttir_row_contract_only_for_pure_simt(compiler_module, monkeypatch):
     events, _command = _run_ttir_to_npubin(
         compiler_module,
@@ -605,7 +733,7 @@ def _run_make_ttir_with_recorded_graph_options(compiler, monkeypatch, options):
         compiler,
         "ascend",
         SimpleNamespace(passes=SimpleNamespace(ttir=SimpleNamespace(
-            add_graph_optimize=lambda _pm, **kwargs: graph_calls.append(kwargs)))),
+            add_graph_optimize=lambda _pm, **kwargs: (events.append("graph_optimize"), graph_calls.append(kwargs))))),
     )
 
     assert compiler.make_ttir(module, {}, options) is module
@@ -615,7 +743,9 @@ def _run_make_ttir_with_recorded_graph_options(compiler, monkeypatch, options):
 def test_make_ttir_passes_canonical_compile_mode_to_graph_optimize(compiler_module, monkeypatch):
     options = SimpleNamespace(
         enable_graph_optimize=True,
+        block_batching_factor=1,
         target_arch="Ascend910B1",
+        compile_on_910_95=False,
         compile_mode="simt_only",
         debug=False,
     )
@@ -625,18 +755,44 @@ def test_make_ttir_passes_canonical_compile_mode_to_graph_optimize(compiler_modu
     assert graph_calls == [{
         "ub_capacity_bytes": 192 * 1024 * 80 // 100,
         "compile_mode": "simt_only",
+        "compile_on_910_95": False,
+        "mapping_l0a_capacity_bytes": 64 * 1024,
+        "mapping_l0b_capacity_bytes": 64 * 1024,
+        "mapping_l0c_capacity_bytes": 128 * 1024,
+        "l0_safety_percent": 80,
+        "core_num": 0,
     }]
     assert events[-1] == "run_row"
+    assert events.index(("loop_unroll", (), {})) < events.index("graph_optimize")
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+def test_make_ttir_disables_graph_pipeline(compiler_module, monkeypatch):
+    options = SimpleNamespace(enable_graph_optimize=False, debug=False)
+    events, graph_calls = _run_make_ttir_with_recorded_graph_options(compiler_module, monkeypatch, options)
+    assert "graph_optimize" not in events
+    assert graph_calls == []
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected_enabled"),
+    (("Ascend910B1", False), ("Ascend910_9581", True), ("Ascend950PR_9579", True)),
+)
+def test_make_ttir_derives_radix_rewrite_gate_from_target(compiler_module, monkeypatch, arch, expected_enabled):
+    options = _parse_options(compiler_module, arch)
+    _, graph_calls = _run_make_ttir_with_recorded_graph_options(compiler_module, monkeypatch, options)
+
+    assert len(graph_calls) == 1
+    assert graph_calls[0]["compile_on_910_95"] is expected_enabled
+
+
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 def test_npu_options_keep_graph_remark_compatibility_default(compiler_module):
     """The legacy graph-remarks name remains discoverable with a fixed default."""
     options = compiler_module.NPUOptions(arch="Ascend910B1")
     assert options.__dict__["graph_optimize_emit_remarks"] is False
 
 
-@pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
+@pytest.mark.skip(reason="The case is not supported on Ascend 950, skipping for now. Will be fixed in future.")
 @pytest.mark.parametrize(
     ("arch", "expected_capacity"),
     (
@@ -658,6 +814,7 @@ def test_make_ttir_forwards_normalized_graph_ub_budget(compiler_module, monkeypa
 def test_ttir_to_npubin_auto_blockify_argv_matrix(compiler_module, monkeypatch):
     common_options = ["--common-before-pure-simt", "--common-after-pure-simt"]
     pure_simt_prefix = [
+        '--enable-debug-info=true',
         "--enable-hivm-compile=false",
         "--enable-triton-ir-compile",
         "--pure-simt",
@@ -814,7 +971,7 @@ def test_non_pure_simt_linalg_compilers_keep_blacklist_auto_blockify_gate(
 
 
 def test_default_compile_mode_keeps_the_91095_layout_memory_gate_prepared(compiler_module):
-    """The canonical default is portable and enables the A5 template gate."""
+    """The canonical default is portable and enables the Ascend 950 template gate."""
 
     a2_default = compiler_module.NPUOptions(arch="Ascend910B1")
     assert a2_default.compile_on_910_95 is False
@@ -868,3 +1025,342 @@ def test_default_compile_mode_keeps_the_91095_layout_memory_gate_prepared(compil
     # Legacy spellings remain discoverable while compile_mode controls lowering.
     assert explicit_only.__dict__["force_simt_only"] is False
     assert explicit_template.__dict__["force_simt_template"] is False
+
+
+@pytest.mark.parametrize(
+    ("arch", "compile_on_910_95", "expected_calls"),
+    (
+        ("Ascend910_9589", True, 1),
+        ("Ascend910_9691", True, 0),
+        ("Ascend910B1", False, 0),
+        (None, False, 0),
+    ),
+)
+def test_ttir_to_linalg_merge_concat_load_buffer_is_a5_only(
+    compiler_module,
+    monkeypatch,
+    arch,
+    compile_on_910_95,
+    expected_calls,
+):
+    events = []
+    merge_calls = []
+
+    def noop(*_args, **_kwargs):
+        return None
+
+    ttir_passes = SimpleNamespace(
+        add_triton_control_flow_opt=noop,
+        add_triton_to_structure=noop,
+        add_discrete_mask_access_conversion=noop,
+        add_triton_to_annotation=noop,
+        add_triton_to_unstructure=noop,
+        add_triton_to_hivm=noop,
+        add_triton_to_hfusion=noop,
+        add_triton_to_llvm=noop,
+        add_bubble_up_operation=noop,
+        add_triton_to_linalg=noop,
+        add_merge_concat_load_buffer=lambda _pm: merge_calls.append(arch),
+    )
+    monkeypatch.setattr(
+        compiler_module,
+        "ir",
+        SimpleNamespace(pass_manager=lambda _context: _FakePassManager(events)),
+    )
+    monkeypatch.setattr(
+        compiler_module,
+        "ascend",
+        SimpleNamespace(passes=SimpleNamespace(ttir=ttir_passes)),
+    )
+    monkeypatch.setattr(compiler_module, "distributed", None)
+    monkeypatch.setattr(compiler_module, "_serialize_module", lambda _mod, _opt: "module {}")
+    monkeypatch.setattr(compiler_module, "_is_auto_map_parallel_blocks_enabled", lambda: False)
+    monkeypatch.setattr(compiler_module, "_get_auto_blockify_blacklist_reasons", lambda _ttir: [])
+    monkeypatch.setattr(compiler_module, "_adjust_metadata_by_module_result", noop)
+    monkeypatch.setattr(compiler_module, "_export_program_grid_metadata", noop)
+
+    metadata = {
+        "compile_on_910_95": compile_on_910_95,
+        "enable_dynamic_cv_pipeline": False,
+    }
+    if arch is not None:
+        metadata["target"] = SimpleNamespace(arch=arch)
+    options = SimpleNamespace(
+        debug=False,
+        compile_mode="simd",
+        target_arch=arch or "Ascend910B1",
+        enable_tla_mode=False,
+    )
+
+    assert compiler_module.ttir_to_linalg(_FakeModule(events), metadata, options) == "module {}"
+    assert merge_calls == ([] if arch is None else [arch] * expected_calls)
+    assert events[-1] == "run_row"
+
+
+@pytest.mark.parametrize(
+    ("arch", "expected_calls"),
+    (
+        ("Ascend910_9581", 1),
+        ("Ascend910_9691", 0),
+        ("Ascend960", 0),
+        ("Ascend910B1", 0),
+    ),
+)
+@pytest.mark.parametrize("target_key", ("target_arch", "arch"))
+def test_ttir_to_linalg_dynamic_cv_pipeline_is_a5_only(
+    compiler_module,
+    monkeypatch,
+    arch,
+    expected_calls,
+    target_key,
+):
+    events = []
+    dynamic_cv_calls = []
+
+    def noop(*_args, **_kwargs):
+        return None
+
+    ttir_passes = SimpleNamespace(
+        add_triton_control_flow_opt=noop,
+        add_triton_to_structure=noop,
+        add_discrete_mask_access_conversion=noop,
+        add_triton_to_annotation=noop,
+        add_triton_to_unstructure=noop,
+        add_triton_to_hivm=noop,
+        add_triton_to_hfusion=noop,
+        add_triton_to_llvm=noop,
+        add_bubble_up_operation=noop,
+        add_triton_to_linalg=noop,
+        add_merge_concat_load_buffer=noop,
+        set_enable_buffer_insert_optimization=noop,
+        add_dynamic_cv_pipeline=lambda _pm, _compile_on_910_95: dynamic_cv_calls.append(arch),
+    )
+    monkeypatch.setattr(
+        compiler_module,
+        "ir",
+        SimpleNamespace(pass_manager=lambda _context: _FakePassManager(events)),
+    )
+    monkeypatch.setattr(
+        compiler_module,
+        "ascend",
+        SimpleNamespace(passes=SimpleNamespace(ttir=ttir_passes)),
+    )
+    monkeypatch.setattr(compiler_module, "distributed", None)
+    monkeypatch.setattr(compiler_module, "_serialize_module", lambda _mod, _opt: "module {}")
+    monkeypatch.setattr(compiler_module, "_is_auto_map_parallel_blocks_enabled", lambda: False)
+    monkeypatch.setattr(compiler_module, "_get_auto_blockify_blacklist_reasons", lambda _ttir: [])
+    monkeypatch.setattr(compiler_module, "_adjust_metadata_by_module_result", noop)
+    monkeypatch.setattr(compiler_module, "_export_program_grid_metadata", noop)
+
+    metadata = {
+        "compile_on_910_95": arch.startswith(("Ascend910_95", "Ascend950", "Ascend910_96", "Ascend960")),
+        "enable_dynamic_cv_pipeline": True,
+        target_key: arch,
+    }
+    options = SimpleNamespace(
+        debug=False,
+        compile_mode="simd",
+        target_arch=arch,
+        enable_tla_mode=False,
+    )
+
+    assert compiler_module.ttir_to_linalg(_FakeModule(events), metadata, options) == "module {}"
+    assert dynamic_cv_calls == [arch] * expected_calls
+
+
+@pytest.mark.parametrize("arch", ["Ascend910B4", "Ascend910_9391", "Ascend950PR"])
+@pytest.mark.parametrize("mode", [
+    {"gm": 4, "l1": 2, "l0c": 1, "ub": 2},
+    {"future": 0, "gm": -1},
+    {},
+])
+def test_multibuffer_mode_preserves_values_and_metadata(compiler_module, arch, mode):
+    options = _parse_options(compiler_module, arch, {"multibuffer_mode": mode})
+    expected = tuple(sorted(mode.items()))
+    assert options.multibuffer_mode == expected
+    assert options.num_stages is None
+    assert options.multibuffer is True
+    metadata = dict(options.__dict__, multibuffer_mode=json.loads(json.dumps(options.multibuffer_mode)))
+    restored = _parse_options(compiler_module, arch, metadata)
+    assert restored.multibuffer_mode == expected
+    assert restored.hash() == options.hash()
+    assert restored.hash() != _parse_options(compiler_module, arch).hash()
+
+
+@pytest.mark.parametrize("mode", [
+    "[(gm,2)]",
+    True,
+    2,
+    {"gm": "2"},
+    {1: 2},
+    {"gm": 2.0},
+    {"gm": True},
+    ("gm", 2),
+    (("gm", ), ),
+    (("gm", 2, 3), ),
+    ((1, 2), ),
+    (("gm", 2.0), ),
+    (("gm", True), ),
+])
+def test_multibuffer_mode_requires_string_keys_and_integer_counts(compiler_module, mode):
+    with pytest.raises(TypeError, match="multibuffer_mode must be a dict"):
+        compiler_module.NPUOptions(multibuffer_mode=mode)
+
+
+@pytest.mark.parametrize("name,value", [
+    ("limit_auto_multi_buffer_only_for_local_buffer", False),
+    ("limit_auto_multi_buffer_of_local_buffer", "no-l0c"),
+    ("limit_auto_multi_buffer_buffer", "only-vector"),
+])
+@pytest.mark.parametrize("mode", [None, {"ub": 2}])
+def test_multibuffer_legacy_options_are_preserved_without_ta_warnings(compiler_module, name, value, mode):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        options = compiler_module.NPUOptions(multibuffer_mode=mode, **{name: value})
+    assert not caught
+    assert getattr(options, name) == value
+    assert options.multibuffer is True
+
+
+def _capture_multibuffer_command(compiler, monkeypatch, is_a5, requested, derived=None, target_object_arch=None,
+                                 metadata_arch_entry=None):
+    options = _parse_options(compiler, "Ascend950PR" if is_a5 else "Ascend910B4", requested)
+    metadata = dict(options.__dict__, target=SimpleNamespace(arch=target_object_arch or options.target_arch),
+                    hash="layout-memory-contract-test", mix_mode="mix", bitcodes=None, auto_blockify_enabled=False)
+    if metadata_arch_entry is not None:
+        metadata.pop("target_arch", None)
+        metadata.pop("arch", None)
+        key, value = metadata_arch_entry
+        metadata[key] = value
+    metadata.update(derived or {})
+    monkeypatch.setattr(compiler, "_parse_linalg_metadata", lambda source, meta: (source, meta))
+    monkeypatch.setattr(compiler, "_finalize_program_launch_policy", lambda *_args: None)
+    monkeypatch.setattr(compiler, "get_common_bishengir_compile_options", lambda _meta: [])
+    monkeypatch.setattr(compiler, "get_auto_bind_sub_block_option", lambda _meta: True)
+    monkeypatch.setattr(compiler, "_get_npucompiler_path", lambda: ("/fake/compiler", {}))
+    monkeypatch.setattr(
+        compiler, "NPUUtils",
+        lambda: SimpleNamespace(get_device_limit=lambda: (False, None, None), get_arch=lambda: options.target_arch,
+                                get_aicore_num=lambda: 28, get_aivector_core_num=lambda: 56))
+    monkeypatch.delenv("TRITON_ENABLE_LIBDEVICE", raising=False)
+
+    class CommandCaptured(BaseException):
+        pass
+
+    commands = []
+
+    def capture(command, **_kwargs):
+        commands.append(command)
+        raise CommandCaptured
+
+    monkeypatch.setattr(compiler.subprocess, "run", capture)
+    compile_fn = (compiler.linalg_to_bin_enable_npu_compile_910_95
+                  if is_a5 else compiler.linalg_to_bin_enable_npu_compile_A2_A3)
+    with pytest.raises(CommandCaptured):
+        compile_fn("module {}", metadata, options)
+    assert len(commands) == 1
+    return commands[0]
+
+
+@pytest.mark.parametrize("metadata_arch_key", ("target_arch", "arch"))
+@pytest.mark.parametrize(("metadata_arch", "expected"), (
+    ("Ascend950PR", True),
+    ("Ascend910_9691", False),
+))
+def test_dynamic_cv_bisheng_option_uses_metadata_arch(
+    compiler_module,
+    monkeypatch,
+    metadata_arch_key,
+    metadata_arch,
+    expected,
+):
+    command = _capture_multibuffer_command(
+        compiler_module,
+        monkeypatch,
+        True,
+        {"enable_dynamic_cv_pipeline": True},
+        target_object_arch="Ascend910B4",
+        metadata_arch_entry=(metadata_arch_key, metadata_arch),
+    )
+    assert ("--enable-vf-operand-substitution=True" in command) is expected
+
+
+@pytest.mark.parametrize("is_a5", [False, True])
+@pytest.mark.parametrize("requested,enabled", [({}, True), ({"num_stages": 1}, False), ({"num_stages": 3}, True),
+                                               ({"multibuffer": False}, False)])
+def test_multibuffer_legacy_command_stays_on_old_interface(compiler_module, monkeypatch, is_a5, requested, enabled):
+    command = _capture_multibuffer_command(compiler_module, monkeypatch, is_a5, requested)
+    assert not any(arg.startswith("--multibuffer-mode=") for arg in command)
+    assert f"--enable-auto-multi-buffer={enabled}" in command
+    assert ("--limit-auto-multi-buffer-of-local-buffer=no-limit" in command) == is_a5
+
+
+@pytest.mark.parametrize("is_a5", [False, True])
+def test_multibuffer_mode_is_forwarded_alongside_existing_defaults(compiler_module, monkeypatch, is_a5):
+    mode = {"ub": 2, "gm": 4, "l0c": 1, "l1": 2}
+    command = _capture_multibuffer_command(compiler_module, monkeypatch, is_a5, {"multibuffer_mode": mode})
+    assert command.count("--multibuffer-mode=[(gm,4),(l0c,1),(l1,2),(ub,2)]") == 1
+    assert "--enable-auto-multi-buffer=True" in command
+    assert ("--limit-auto-multi-buffer-of-local-buffer=no-limit" in command) == is_a5
+
+
+@pytest.mark.parametrize("is_a5", [False, True])
+@pytest.mark.parametrize("switch", [False, True])
+def test_multibuffer_explicit_old_options_are_still_forwarded(compiler_module, monkeypatch, is_a5, switch):
+    requested = {
+        "multibuffer_mode": {"gm": 4, "l1": 2, "l0c": 2, "ub": 2},
+        "multibuffer": switch,
+        "limit_auto_multi_buffer_only_for_local_buffer": True,
+        "limit_auto_multi_buffer_of_local_buffer": "no-l0c",
+        "limit_auto_multi_buffer_buffer": "only-vector",
+        "set_workspace_multibuffer": 0,
+    }
+    command = _capture_multibuffer_command(compiler_module, monkeypatch, is_a5, requested)
+    assert "--multibuffer-mode=[(gm,4),(l0c,2),(l1,2),(ub,2)]" in command
+    assert f"--enable-auto-multi-buffer={switch}" in command
+    assert "--limit-auto-multi-buffer-only-for-local-buffer=True" in command
+    assert "--limit-auto-multi-buffer-of-local-buffer=no-l0c" in command
+    assert "--set-workspace-multibuffer=0" in command
+    if is_a5:
+        assert "--limit-auto-multi-buffer-buffer=only-vector" in command
+
+
+def test_multibuffer_keeps_dynamic_cv_workspace_constraint(compiler_module, monkeypatch):
+    command = _capture_multibuffer_command(compiler_module, monkeypatch, True,
+                                           {"multibuffer_mode": {"gm": 4, "l1": 2, "l0c": 1, "ub": 2}},
+                                           derived={"set_workspace_multibuffer": 0})
+    assert "--set-workspace-multibuffer=0" in command
+
+
+@pytest.mark.parametrize("is_a5", [False, True])
+def test_multibuffer_value_semantics_are_left_to_npuir(compiler_module, monkeypatch, is_a5):
+    # Level names and count ranges are vendor decisions; partial modes are forwarded as supplied.
+    command = _capture_multibuffer_command(compiler_module, monkeypatch, is_a5,
+                                           {"multibuffer_mode": {"future": 0, "ub": -1}})
+    assert "--multibuffer-mode=[(future,0),(ub,-1)]" in command
+
+
+@pytest.mark.parametrize("arch", ["Ascend910B4", "Ascend910_9391", "Ascend950PR"])
+@pytest.mark.parametrize("stages", [0, 1, 2, 3])
+@pytest.mark.parametrize("mode", [{"gm": 2, "l1": 2, "l0c": 2, "ub": 2}, {}])
+def test_multibuffer_mode_rejects_num_stages_even_when_equivalent(compiler_module, arch, stages, mode):
+    with pytest.raises(ValueError, match="num_stages and multibuffer_mode cannot be specified together"):
+        _parse_options(compiler_module, arch, {"multibuffer_mode": mode, "num_stages": stages})
+
+
+def test_multibuffer_default_num_stages_does_not_conflict(compiler_module):
+    assert compiler_module.NPUOptions().num_stages == 2
+    assert compiler_module.NPUOptions(num_stages=1).num_stages == 1
+    options = compiler_module.NPUOptions(multibuffer_mode={"ub": 2}, num_stages=None)
+    assert options.num_stages is None
+
+
+@pytest.mark.parametrize("arch", ["Ascend910B4", "Ascend950PR"])
+def test_multibuffer_dictionary_order_does_not_change_compiler_hash(compiler_module, arch):
+    mode = {"ub": 2, "gm": 4, "l1": 2}
+    options = _parse_options(compiler_module, arch, {"multibuffer_mode": mode})
+    reordered = _parse_options(compiler_module, arch, {"multibuffer_mode": dict(reversed(list(mode.items())))})
+    assert reordered.multibuffer_mode == options.multibuffer_mode
+    assert reordered.hash() == options.hash()
+    mode["ub"] = 8
+    assert dict(options.multibuffer_mode)["ub"] == 2

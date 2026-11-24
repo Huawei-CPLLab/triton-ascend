@@ -69,6 +69,9 @@ def _load_autotuner_methods(*method_names):
         "VectorAxes": _load_vector_axes_module().VectorAxes,
         "_InternalNPUOptionInt": ascend_autotuner._InternalNPUOptionInt,
         "_DEFAULT_COMPILE_MODE": ascend_autotuner._DEFAULT_COMPILE_MODE,
+        "_multibuffer_mode_to_tuple": ascend_autotuner._multibuffer_mode_to_tuple,
+        "_normalize_config_hints": ascend_autotuner._normalize_config_hints,
+        "knobs": triton.knobs,
     }
     exec(compile(extracted_module, str(AUTOTUNER_PATH), "exec"), namespace)
     return namespace
@@ -566,6 +569,7 @@ def test_generate_key_and_configs_uses_axis_arg_names_for_kv_dict():
         auto_gen_config=True,
         parser_mode="vector",
         config_hints={},
+        _raw_config_hints={},
         gen_configs=[],
         user_configs=[],
         is_simt_mode=False,
@@ -648,6 +652,7 @@ def test_generate_key_and_configs_preserves_promoted_reduction_axis_identity():
         auto_gen_config=True,
         parser_mode="vector",
         config_hints={},
+        _raw_config_hints={},
         gen_configs=[],
         user_configs=[],
         is_simt_mode=False,
@@ -722,6 +727,7 @@ def test_refresh_vector_axes_keeps_base_axis_arg_names_without_reduction_aliases
         auto_gen_config=True,
         parser_mode="vector",
         config_hints={},
+        _raw_config_hints={},
         gen_configs=[],
         user_configs=[],
         is_simt_mode=False,
@@ -801,7 +807,6 @@ def test_legacy_low_dim_and_tiling_parsers_consume_base_axis_names():
     refresh_calls = []
     tuner = SimpleNamespace(
         fn=SimpleNamespace(parse=lambda: "fake-func-ast"),
-        print_autotuning=False,
         tiling_params={},
         low_dim_axes=[],
         _get_parser_axis_arg_names=lambda: {"x": "x0_numel", "y": "r1_numel"},
@@ -1549,9 +1554,10 @@ def test_non_simt_num_stages_candidates_priority():
 def test_expand_simt_num_warps_configs_default_candidates():
     tuner = object.__new__(ascend_autotuner.AutoTilingTuner)
     tuner.user_specified_warps = None
-    tuner.print_autotuning = False
 
-    expanded_configs = tuner._expand_simt_num_warps_configs([triton.Config({"BLOCK_SIZE": 128})])
+    with triton.knobs.autotuning.scope():
+        triton.knobs.autotuning.print = False
+        expanded_configs = tuner._expand_simt_num_warps_configs([triton.Config({"BLOCK_SIZE": 128})])
 
     assert len(expanded_configs) == 4
     assert [cfg.num_warps for cfg in expanded_configs] == [8, 16, 32, 64]
@@ -1607,7 +1613,6 @@ def test_autoparse_reduction_axes_rejects_prefixed_parser_output():
         fn=SimpleNamespace(parse=lambda: "fake-func-ast"),
         axis_arg_names={"x": "seq_len", "y": "dim"},
         reduction_axes=[],
-        print_autotuning=False,
         _get_parser_axis_arg_names=lambda: {"x": "seq_len", "y": "dim"},
         _promote_axis_arg_name_to_reduction=lambda axis: promoted_axes.append(axis),
         _refresh_vector_axes=lambda: refresh_calls.append(True),
@@ -1653,7 +1658,7 @@ def test_inject_grid_num_tiles_uses_only_static_grid_and_preserves_internal_valu
 
 
 def test_make_kernel_call_extracts_name_from_jit_run():
-    namespace = _load_autotuner_methods("_make_kernel_call")
+    namespace = _load_autotuner_methods("_make_kernel_call", "_default_block_batching")
     _make_kernel_call = _normalize_loaded_method(namespace["_make_kernel_call"])
 
     @triton.jit
@@ -1664,8 +1669,11 @@ def test_make_kernel_call_extracts_name_from_jit_run():
         x = tl.load(x_ptr + offsets, mask=mask)
         tl.store(x_ptr + offsets, x, mask=mask)
 
-    fake_self = SimpleNamespace(fn=test_kernel_jit, pre_hook=lambda full_nargs: None,
+    observed = []
+    fake_self = SimpleNamespace(fn=test_kernel_jit, arg_names=test_kernel_jit.arg_names,
+                                pre_hook=lambda full_nargs: observed.append(dict(full_nargs)),
                                 post_hook=lambda full_nargs, exception=None: None, nargs={})
+    fake_self._default_block_batching = namespace["_default_block_batching"].__get__(fake_self)
     fake_config = SimpleNamespace(kwargs={"BLOCK_SIZE": 32}, all_kwargs=lambda: {"BLOCK_SIZE": 32}, pre_hook=None)
 
     x = torch.zeros(128, dtype=torch.float32, device="npu")
@@ -1673,10 +1681,11 @@ def test_make_kernel_call_extracts_name_from_jit_run():
     kernel_call_closure(warmup=False)
 
     assert kernel_call_closure.target_kernel_name == "test_kernel_jit"
+    assert observed[0]["block_batching_factor"] == 1
 
 
 def test_make_kernel_call_extracts_name_from_libentry_tuple():
-    namespace = _load_autotuner_methods("_make_kernel_call")
+    namespace = _load_autotuner_methods("_make_kernel_call", "_default_block_batching")
     _make_kernel_call = _normalize_loaded_method(namespace["_make_kernel_call"])
 
     from triton.runtime.libentry import libentry
@@ -1690,8 +1699,11 @@ def test_make_kernel_call_extracts_name_from_libentry_tuple():
         x = tl.load(x_ptr + offsets, mask=mask)
         tl.store(x_ptr + offsets, x, mask=mask)
 
-    fake_self = SimpleNamespace(fn=test_kernel_libentry, pre_hook=lambda full_nargs: None,
+    observed = []
+    fake_self = SimpleNamespace(fn=test_kernel_libentry, arg_names=test_kernel_libentry.fn.arg_names,
+                                pre_hook=lambda full_nargs: observed.append(dict(full_nargs)),
                                 post_hook=lambda full_nargs, exception=None: None, nargs={})
+    fake_self._default_block_batching = namespace["_default_block_batching"].__get__(fake_self)
     fake_config = SimpleNamespace(kwargs={"BLOCK_SIZE": 32}, all_kwargs=lambda: {"BLOCK_SIZE": 32}, pre_hook=None)
 
     x = torch.zeros(128, dtype=torch.float32, device="npu")
@@ -1699,3 +1711,4 @@ def test_make_kernel_call_extracts_name_from_libentry_tuple():
     kernel_call_closure(warmup=False)
 
     assert kernel_call_closure.target_kernel_name == "test_kernel_libentry"
+    assert observed[0]["block_batching_factor"] == 1

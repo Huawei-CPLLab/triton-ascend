@@ -14,8 +14,11 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/MathExtras.h"
 #include <optional>
 
 namespace mlir {
@@ -127,7 +130,7 @@ struct TritonFpToFpToHFusionConversion : OpRewritePattern<triton::FpToFpOp> {
     // Create the HFusion cast operation with round_mode attribute
     auto roundModeAttr =
         hfusion::RoundModeAttr::get(rewriter.getContext(), hfusionRoundMode);
-    auto modeAttr = rewriter.getNamedAttr("mode", roundModeAttr);
+    auto modeAttr = rewriter.getNamedAttr("round_mode", roundModeAttr);
 
     rewriter.replaceOpWithNewOp<hfusion::CastOp>(
         op, ValueRange{input}, ValueRange{dsts}, ArrayRef{modeAttr});
@@ -148,9 +151,27 @@ struct TritonConv1dToHFusionConversion
     Value weight = op.getWeight();
     Value biasValue = op.getBias();
     int64_t stride = op.getStride();
-    int64_t padding_size = op.getPaddingSize();
     int64_t dilation = op.getDilation();
     int64_t groups = op.getGroups();
+
+    // Parse padding: an integer (uniform scalar) or a 2-element
+    // [pad_left, pad_right] array.
+    auto parseParam =
+        [](Attribute attr) -> std::optional<SmallVector<int64_t>> {
+      if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+        return SmallVector<int64_t>{intAttr.getInt()};
+      if (auto arrayAttr = dyn_cast<DenseI32ArrayAttr>(attr)) {
+        SmallVector<int64_t> values;
+        for (int32_t v : arrayAttr.asArrayRef())
+          values.push_back(static_cast<int64_t>(v));
+        return values;
+      }
+      return std::nullopt;
+    };
+    auto padding = parseParam(op.getPadding());
+    if (!padding || padding->empty() || padding->size() > 2) {
+      return failure();
+    }
 
     auto inputType = mlir::cast<RankedTensorType>(input.getType());
     auto weightType = mlir::cast<RankedTensorType>(weight.getType());
@@ -169,11 +190,20 @@ struct TritonConv1dToHFusionConversion
     int64_t C_out = weightShape[0];
     int64_t kernel_size = weightShape[2];
 
+    // Expand padding to [pad_left, pad_right].
+    SmallVector<int64_t> pads;
+    if (padding->size() == 1) {
+      pads.assign(2, (*padding)[0]);
+    } else {
+      pads.assign(padding->begin(), padding->end());
+    }
+
     if (stride == 0) {
       return failure();
     }
+    // pads = [pad_left, pad_right]
     int64_t L_out =
-        (L_in + 2 * padding_size - dilation * (kernel_size - 1) - 1) / stride +
+        (L_in + pads[0] + pads[1] - dilation * (kernel_size - 1) - 1) / stride +
         1;
 
     auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
@@ -199,8 +229,17 @@ struct TritonConv1dToHFusionConversion
       ins.push_back(biasValue);
     }
 
+    // Preserve the user's form: an integer stays a scalar IntegerAttr, a
+    // 2-element sequence stays [pad_left, pad_right]. `pads` (the 2-element
+    // expansion) is only used for the output-dim computation above.
+    Attribute paddingAttr;
+    if (padding->size() == 1)
+      paddingAttr = rewriter.getI64IntegerAttr((*padding)[0]);
+    else
+      paddingAttr = rewriter.getDenseI64ArrayAttr(*padding);
+
     auto newOp = rewriter.create<hfusion::Conv1DOp>(
-        loc, ins, initTensor, stride, padding_size, dilation, groups);
+        loc, ins, initTensor, stride, paddingAttr, dilation, groups);
 
     rewriter.replaceOp(op, newOp.getResult());
 
@@ -330,6 +369,124 @@ struct TritonConv2dToHFusionConversion
     return success();
   }
 };
+
+/// Lower `tt.reshape(tt.join(a, b))` (`[..., D, 2] -> [..., 2*D]`, produced by
+/// `tl.interleave`) directly to `hfusion.interleave`.
+struct TritonJoinReshapeToInterleaveConversion
+    : OpRewritePattern<triton::ReshapeOp> {
+  using OpRewritePattern<triton::ReshapeOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::ReshapeOp op,
+                                PatternRewriter &rewriter) const final {
+    if (op.getAllowReorder())
+      return failure();
+    auto joinOp = op.getSrc().getDefiningOp<triton::JoinOp>();
+    if (!joinOp)
+      return failure();
+
+    auto dstType = dyn_cast<RankedTensorType>(op.getResult().getType());
+    auto srcType = dyn_cast<RankedTensorType>(joinOp.getLhs().getType());
+    if (!dstType || !srcType || !dstType.hasStaticShape() ||
+        !srcType.hasStaticShape() || dstType.getRank() < 1 ||
+        dstType.getRank() != srcType.getRank() ||
+        dstType.getElementType() != srcType.getElementType())
+      return failure();
+
+    int64_t lastDim = dstType.getRank() - 1;
+    if (dstType.getDimSize(lastDim) != 2 * srcType.getDimSize(lastDim) ||
+        !llvm::equal(dstType.getShape().take_front(lastDim),
+                     srcType.getShape().take_front(lastDim)))
+      return failure();
+
+    auto interleaveOp = rewriter.create<hfusion::InterleaveOp>(
+        op.getLoc(), dstType, ValueRange{joinOp.getLhs(), joinOp.getRhs()});
+    rewriter.replaceOp(op, interleaveOp.getResult());
+    if (joinOp->use_empty())
+      rewriter.eraseOp(joinOp);
+    return success();
+  }
+};
+
+/// Lower innermost power-of-two replication
+/// `tt.reshape(tt.broadcast(tt.expand_dims(x, lastDim), R))`
+/// (`[..., D] -> [..., D, 1] -> [..., D, R] -> [..., D*R]`) into a
+/// `log2(R)` cascade of `hfusion.interleave` operations.
+struct TritonInnerBroadcastReshapeToInterleaveConversion
+    : OpRewritePattern<triton::ReshapeOp> {
+  using OpRewritePattern<triton::ReshapeOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::ReshapeOp op,
+                                PatternRewriter &rewriter) const final {
+    if (op.getAllowReorder())
+      return failure();
+    auto bcastOp = op.getSrc().getDefiningOp<triton::BroadcastOp>();
+    if (!bcastOp)
+      return failure();
+
+    auto dstType = dyn_cast<RankedTensorType>(op.getResult().getType());
+    auto bcastType = dyn_cast<RankedTensorType>(bcastOp.getResult().getType());
+    auto bcastSrcType = dyn_cast<RankedTensorType>(bcastOp.getSrc().getType());
+    if (!dstType || !bcastType || !bcastSrcType || !dstType.hasStaticShape() ||
+        !bcastType.hasStaticShape() || !bcastSrcType.hasStaticShape())
+      return failure();
+
+    int64_t rank = dstType.getRank();
+    if (rank < 1 || bcastType.getRank() != rank + 1 ||
+        bcastSrcType.getRank() != rank + 1 ||
+        bcastSrcType.getShape().back() != 1)
+      return failure();
+
+    int64_t repeat = bcastType.getShape().back();
+    if (repeat < 2 || !llvm::isPowerOf2_64(static_cast<uint64_t>(repeat)))
+      return failure();
+
+    ArrayRef<int64_t> baseShape = bcastType.getShape().drop_back(1);
+    if (!llvm::equal(bcastSrcType.getShape().drop_back(1), baseShape) ||
+        !llvm::equal(dstType.getShape().drop_back(1),
+                     baseShape.drop_back(1)) ||
+        dstType.getShape().back() != baseShape.back() * repeat)
+      return failure();
+
+    Location loc = op.getLoc();
+    auto baseTy = RankedTensorType::get(baseShape, dstType.getElementType());
+    Value baseVal;
+    Operation *unitInnerOp = bcastOp.getSrc().getDefiningOp();
+    if (auto expandOp = dyn_cast_or_null<triton::ExpandDimsOp>(unitInnerOp)) {
+      if (expandOp.getAxis() == rank)
+        baseVal = expandOp.getSrc();
+    } else if (auto innerReshape =
+                   dyn_cast_or_null<triton::ReshapeOp>(unitInnerOp)) {
+      if (!innerReshape.getAllowReorder()) {
+        if (innerReshape.getSrc().getType() == baseTy)
+          baseVal = innerReshape.getSrc();
+        else
+          baseVal = rewriter.create<triton::ReshapeOp>(loc, baseTy,
+                                                       innerReshape.getSrc());
+      }
+    }
+    if (!baseVal)
+      baseVal =
+          rewriter.create<triton::ReshapeOp>(loc, baseTy, bcastOp.getSrc());
+
+    Value cur = baseVal;
+    SmallVector<int64_t, 4> stepShape(baseShape.begin(), baseShape.end());
+    for (int64_t step = 1; step < repeat; step *= 2) {
+      stepShape.back() *= 2;
+      auto stepTy = RankedTensorType::get(stepShape, dstType.getElementType());
+      cur = rewriter
+                .create<hfusion::InterleaveOp>(loc, stepTy,
+                                               ValueRange{cur, cur})
+                .getResult();
+    }
+
+    rewriter.replaceOp(op, cur);
+    if (bcastOp->use_empty())
+      rewriter.eraseOp(bcastOp);
+    if (unitInnerOp && unitInnerOp->use_empty())
+      rewriter.eraseOp(unitInnerOp);
+    return success();
+  }
+};
 } // namespace
 
 namespace {
@@ -357,6 +514,9 @@ void TritonToHFusionPass::runOnOperation() {
   patterns.add<TritonModToHFusionConversion>(patterns.getContext());
   patterns.add<TritonConv1dToHFusionConversion>(patterns.getContext());
   patterns.add<TritonConv2dToHFusionConversion>(patterns.getContext());
+  patterns.add<TritonJoinReshapeToInterleaveConversion>(patterns.getContext());
+  patterns.add<TritonInnerBroadcastReshapeToInterleaveConversion>(
+      patterns.getContext());
 
   // Apply patterns with greedy rewriting
   // This allows patterns to return failure() without causing pass failure

@@ -290,6 +290,8 @@ LogicalResult MaskState::parse(Value operand, const Location &loc,
           [&](auto op) { return this->parseConstant(op, loc, builder); })
       .Case<arith::AddIOp>(
           [&](auto op) { return this->parseAdd(op, loc, builder); })
+      .Case<arith::SubIOp>(
+          [&](auto op) { return this->parseSub(op, loc, builder); })
       .Case<arith::AndIOp>(
           [&](auto op) { return this->parseAnd(op, loc, builder); })
       .Case<arith::CmpIOp>(
@@ -475,6 +477,42 @@ LogicalResult MaskState::addStates(const MaskState &lhsState,
   }
 }
 
+LogicalResult MaskState::subStateScalar(const MaskState &state,
+                                        const OpFoldResult scalar,
+                                        const Location &loc,
+                                        OpBuilder &builder) {
+  start = subOpFoldResult(state.start, scalar, loc, builder);
+  end = subOpFoldResult(state.end, scalar, loc, builder);
+  if (!start || !end)
+    return failure();
+  dims = state.dims;
+  offsets = state.offsets;
+
+  bool allDimsOne = llvm::all_of(state.dims, [](OpFoldResult dim) {
+    return getConstantIntValue(dim).value() == std::optional<int64_t>(1);
+  });
+  if (allDimsOne) {
+    this->scalar = this->start;
+  }
+
+  return success();
+}
+
+LogicalResult MaskState::subStates(const MaskState &lhsState,
+                                   const MaskState &rhsState,
+                                   const Location &loc, OpBuilder &builder) {
+  // Contiguous mask indices only keep a monotonic range when subtracting a
+  // scalar from a range: (arange - C). scalar - range is rejected.
+  if (!lhsState.scalar && rhsState.scalar)
+    return subStateScalar(lhsState, rhsState.scalar, loc, builder);
+
+  InFlightDiagnostic diag =
+      emitWarning(loc)
+      << "Unsupported subi for continuous mask: only (range - scalar) is "
+         "supported";
+  return failure();
+}
+
 LogicalResult MaskState::divStateScalar(const MaskState &state,
                                         const OpFoldResult scalar,
                                         const Location &loc,
@@ -589,6 +627,21 @@ LogicalResult MaskState::parseAdd(arith::AddIOp addOp, const Location &loc,
     return failure();
   }
   return this->addStates(lhsState, rhsState, loc, builder);
+}
+
+LogicalResult MaskState::parseSub(arith::SubIOp subOp, const Location &loc,
+                                  OpBuilder &builder) {
+  assert(this->isEmpty());
+  MaskState lhsState;
+  if (failed(lhsState.parse(subOp.getLhs(), loc, builder))) {
+    return failure();
+  }
+
+  MaskState rhsState;
+  if (failed(rhsState.parse(subOp.getRhs(), loc, builder))) {
+    return failure();
+  }
+  return this->subStates(lhsState, rhsState, loc, builder);
 }
 
 LogicalResult MaskState::parseDiv(arith::DivSIOp divOp, const Location &loc,
@@ -880,24 +933,10 @@ LogicalResult MaskState::parseSplat(triton::SplatOp splatOp,
   if (failed(this->parse(src, loc, builder)))
     return failure();
 
-  auto splatAsMask = [&](Operation *userOp) -> bool {
-    return TypeSwitch<Operation *, bool>(userOp)
-        .Case<arith::AndIOp>([&](arith::AndIOp andOp) { return true; })
-        .Case<arith::SelectOp>([&](arith::SelectOp selectOp) {
-          return selectOp.getCondition() == dst;
-        })
-        .Case<triton::LoadOp>(
-            [&](triton::LoadOp loadOp) { return loadOp.getMask() == dst; })
-        .Case<triton::StoreOp>(
-            [&](triton::StoreOp storeOp) { return storeOp.getMask() == dst; })
-        .Case<triton::AtomicRMWOp>([&](triton::AtomicRMWOp atomicOp) {
-          return atomicOp.getMask() == dst;
-        })
-        .Default([&](Operation *op) { return false; });
-  };
-
-  if (src.getType().isInteger(1) && !splatOp->use_empty() &&
-      llvm::all_of(splatOp->getUsers(), splatAsMask)) {
+  // A uniform boolean mask covers either the whole tensor or no elements.
+  // Its other uses (including numerical and indirect-memory consumers) must
+  // not change the active extent of the memory access being analyzed.
+  if (src.getType().isInteger(1)) {
     for (auto s : dstShape) {
       auto currentDim = mulOpFoldResult(builder.getIndexAttr(s), this->scalar,
                                         loc, builder, builder.getIndexType());
@@ -990,6 +1029,74 @@ void MaskState::eraseInsertedOps(Operation *rawOp, PatternRewriter &rewriter) {
       worklist.push_back(defOp);
     }
   }
+}
+
+// Recursively collect all leaf operands of a nested arith::AndIOp tree.
+// This function also normalizes masks by distributing broadcast over andi
+//   broadcast(andi(a, b)) = andi(broadcast(a), broadcast(b))
+// so that inner AND operands nested inside a broadcast are still reachable.
+static void collectAndLeaves(Value mask, SmallVectorImpl<Value> &leaves,
+                             Location loc, PatternRewriter &rewriter) {
+  if (auto andOp = mask.getDefiningOp<arith::AndIOp>()) {
+    collectAndLeaves(andOp.getLhs(), leaves, loc, rewriter);
+    collectAndLeaves(andOp.getRhs(), leaves, loc, rewriter);
+  } else if (auto broadcastOp = mask.getDefiningOp<triton::BroadcastOp>()) {
+    // Distribute broadcast over andi so we can inspect each factor separately.
+    if (auto innerAnd = broadcastOp.getSrc().getDefiningOp<arith::AndIOp>()) {
+      Type dstType = mask.getType();
+      Value broadcastA =
+          rewriter.create<triton::BroadcastOp>(loc, dstType, innerAnd.getLhs())
+              .getResult();
+      Value broadcastB =
+          rewriter.create<triton::BroadcastOp>(loc, dstType, innerAnd.getRhs())
+              .getResult();
+      collectAndLeaves(broadcastA, leaves, loc, rewriter);
+      collectAndLeaves(broadcastB, leaves, loc, rewriter);
+    } else {
+      leaves.push_back(mask);
+    }
+  } else {
+    leaves.push_back(mask);
+  }
+}
+
+// Decompose an AND-tree mask into its continuous and discrete leaf components
+// so that we can use contMask to bound GM accesses while discMask still drives
+// the per-element selection.
+MaskDecomposition decomposeAndMask(Operation *op, Value mask,
+                                   const Location &loc,
+                                   PatternRewriter &rewriter) {
+  SmallVector<Value> leaves;
+  collectAndLeaves(mask, leaves, loc, rewriter);
+
+  SmallVector<Value> contLeaves;
+  SmallVector<Value> discLeaves;
+
+  for (Value leaf : leaves) {
+    MaskState st;
+    if (st.parse(leaf, loc, rewriter).succeeded()) {
+      if (st.isMask())
+        contLeaves.push_back(leaf);
+      else
+        discLeaves.push_back(leaf);
+    } else {
+      discLeaves.push_back(leaf);
+    }
+  }
+
+  Value contMask = nullptr;
+  for (Value v : contLeaves)
+    contMask =
+        contMask ? rewriter.create<arith::AndIOp>(loc, contMask, v).getResult()
+                 : v;
+
+  Value discMask = nullptr;
+  for (Value v : discLeaves)
+    discMask =
+        discMask ? rewriter.create<arith::AndIOp>(loc, discMask, v).getResult()
+                 : v;
+
+  return {contMask, discMask};
 }
 
 std::optional<MaskState> runMaskAnalysis(Operation *op, OpBuilder &builder) {

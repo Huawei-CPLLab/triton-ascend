@@ -35,6 +35,7 @@ void registerMergeSameSourceAxisPass();
 std::unique_ptr<OperationPass<ModuleOp>> createUnifyAllocBlockPass();
 void registerUnifyAllocBlockPass();
 std::unique_ptr<OperationPass<ModuleOp>> createMergeVectorIfBlockPass();
+std::unique_ptr<OperationPass<ModuleOp>> createMergeOuterVectorBlockPass();
 void registerMergeVectorIfBlockPass();
 std::unique_ptr<OperationPass<ModuleOp>> createUnifyStoreBlockPass();
 void registerUnifyStoreBlockPass();
@@ -51,7 +52,9 @@ std::unique_ptr<OperationPass<ModuleOp>>
 createMergeInputInitSharedCubeBlockPass();
 
 std::unique_ptr<OperationPass<ModuleOp>> createSplitIfByBlockIdPass();
+std::unique_ptr<OperationPass<ModuleOp>> createCloneCubeDepInIfPass();
 std::unique_ptr<OperationPass<ModuleOp>> createExpSubfPatternPass();
+std::unique_ptr<OperationPass<ModuleOp>> createExpLoadPatternPass();
 void registerSplitIfByBlockIdPass();
 
 } // namespace triton

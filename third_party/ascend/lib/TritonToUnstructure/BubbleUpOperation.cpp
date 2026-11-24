@@ -27,13 +27,17 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
+#include <limits>
+
 #define DEBUG_TYPE "triton-bubble-up-operation"
 
 template <typename ExtractOpTy>
 BubbleUpExtract<ExtractOpTy>::BubbleUpExtract(MLIRContext *context,
-                                              bool enableAggressiveMode)
+                                              bool enableAggressiveMode,
+                                              bool compileOn91095)
     : OpRewritePattern<ExtractOpTy>(context),
-      enableAggressiveMode(enableAggressiveMode) {}
+      enableAggressiveMode(enableAggressiveMode),
+      compileOn91095(compileOn91095) {}
 
 template <typename ExtractOpTy>
 LogicalResult
@@ -107,6 +111,14 @@ BubbleUpExtract<ExtractOpTy>::matchAndRewrite(ExtractOpTy op,
   } else if (auto truncFOp = dyn_cast<arith::TruncFOp>(parentOp)) {
     bubbleUpOperation(op, truncFOp, loc, rewriter);
   } else if (auto extFOp = dyn_cast<arith::ExtFOp>(parentOp)) {
+    // In misaligned scenarios, the vector cast (vcast) that arith.extf
+    // lowers to is unsupported and falls back to a scalar cast, which does
+    // not support the bf16 data type on non-A5 targets. Bubbling the slice
+    // above the extf on a bf16 source (2 bytes/element) can turn an aligned
+    // f32 slice into a misaligned bf16 slice, so keep the cast first in that
+    // case.
+    if (!compileOn91095 && isBf16ExtSliceMisaligned(op, extFOp))
+      return failure();
     bubbleUpOperation(op, extFOp, loc, rewriter);
   } else if (auto fpTosiOp = dyn_cast<arith::FPToSIOp>(parentOp)) {
     bubbleUpOperation(op, fpTosiOp, loc, rewriter);
@@ -135,6 +147,13 @@ BubbleUpExtract<ExtractOpTy>::matchAndRewrite(ExtractOpTy op,
   } else if (auto splatOp = dyn_cast<triton::SplatOp>(parentOp)) {
     bubbleUpOperation(op, splatOp, loc, rewriter);
   } else if (auto makeRangeOp = dyn_cast<triton::MakeRangeOp>(parentOp)) {
+    if constexpr (std::is_same_v<ExtractOpTy, tensor::ExtractSliceOp>) {
+      auto size = getConstantIntValue(op.getMixedSizes()[0]);
+      // A new tt.make_range needs a static extent representable by its i32
+      // endpoints. Other slices must keep their original extraction.
+      if (!size || *size <= 0 || *size > std::numeric_limits<int32_t>::max())
+        return failure();
+    }
     bubbleUpOperation(op, makeRangeOp, loc, rewriter);
   } else if (auto addPtrOp = dyn_cast<triton::AddPtrOp>(parentOp)) {
     bubbleUpOperation(op, addPtrOp, loc, rewriter);
@@ -192,6 +211,35 @@ Value BubbleUpExtract<tensor::ExtractSliceOp>::createExtractOp(
   extractedOp->setAttr(ConverterUtils::discreteAttrName,
                        UnitAttr::get(rewriter.getContext()));
   return extractedOp;
+}
+
+template <typename ExtractOpTy>
+bool BubbleUpExtract<ExtractOpTy>::isBf16ExtSliceMisaligned(
+    ExtractOpTy op, arith::ExtFOp parentOp) const {
+  if constexpr (!std::is_same_v<ExtractOpTy, tensor::ExtractSliceOp>) {
+    return false;
+  } else {
+    auto srcType = dyn_cast<RankedTensorType>(parentOp.getIn().getType());
+    if (!srcType || !srcType.getElementType().isBF16())
+      return false;
+    auto shape = srcType.getShape();
+    auto offsets = op.getMixedOffsets();
+    if (shape.size() != offsets.size())
+      return true;
+    // Row-major linear element offset of the slice start within the source.
+    int64_t linearOffset = 0;
+    int64_t stride = 1;
+    for (int64_t i = shape.size() - 1; i >= 0; --i) {
+      auto offset = getConstantIntValue(offsets[i]);
+      // Skip dynamic offset
+      if (!offset)
+        return true;
+      linearOffset += *offset * stride;
+      stride *= shape[i];
+    }
+    // bf16 is 2 bytes/element: 32-byte aligned if linearOffset % 16 == 0.
+    return linearOffset % 16 != 0;
+  }
 }
 
 template <typename ExtractOpTy>
@@ -408,13 +456,34 @@ template <>
 void BubbleUpExtract<tensor::ExtractSliceOp>::bubbleUpOperation(
     tensor::ExtractSliceOp op, triton::MakeRangeOp parentOp, Location loc,
     PatternRewriter &rewriter) const {
-  auto resultType = cast<RankedTensorType>(parentOp.getResult().getType());
+  auto resultType = cast<RankedTensorType>(op.getResult().getType());
   auto idxOfr = op.getMixedOffsets()[0];
   Value idx = getValueOrCreateConstantIndexOp(rewriter, op.getLoc(), idxOfr);
   idx = rewriter.create<arith::IndexCastOp>(op.getLoc(),
                                             resultType.getElementType(), idx);
-  rewriter.replaceOpWithNewOp<triton::SplatOp>(op, op.getResult().getType(),
-                                               idx);
+  if (parentOp.getStart() != 0) {
+    Value start = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(resultType.getElementType(),
+                                     parentOp.getStart()));
+    idx = rewriter.create<arith::AddIOp>(loc, idx, start);
+  }
+  Value base = rewriter.create<triton::SplatOp>(loc, resultType, idx);
+  int64_t size = *getConstantIntValue(op.getMixedSizes()[0]);
+  if (size == 1) {
+    rewriter.replaceOp(op, base);
+    return;
+  }
+
+  Value range = rewriter.create<triton::MakeRangeOp>(loc, resultType, 0, size);
+  auto strideOfr = op.getMixedStrides()[0];
+  if (getConstantIntValue(strideOfr) != 1) {
+    Value stride = getValueOrCreateConstantIndexOp(rewriter, loc, strideOfr);
+    stride = rewriter.create<arith::IndexCastOp>(
+        loc, resultType.getElementType(), stride);
+    stride = rewriter.create<triton::SplatOp>(loc, resultType, stride);
+    range = rewriter.create<arith::MulIOp>(loc, range, stride);
+  }
+  rewriter.replaceOpWithNewOp<arith::AddIOp>(op, base, range);
 }
 
 template <typename ExtractOpTy>
@@ -542,8 +611,8 @@ void BubbleUpOperationPass::runOnOperation() {
 
   RewritePatternSet patterns(ctx);
   patterns.add<BubbleUpExtract<tensor::ExtractOp>,
-               BubbleUpExtract<tensor::ExtractSliceOp>>(ctx,
-                                                        enableAggressiveMode);
+               BubbleUpExtract<tensor::ExtractSliceOp>>(
+      ctx, enableAggressiveMode, compileOn91095);
 
   if (failed(applyPatternsGreedily(moduleOp, std::move(patterns)))) {
     moduleOp->emitError("failed to apply Patterns");
