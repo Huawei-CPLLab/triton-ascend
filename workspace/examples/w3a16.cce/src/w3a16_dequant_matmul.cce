@@ -1,0 +1,51 @@
+/**
+ * Global kernel entry point for W3A16 group-wise dequant + FP16 GEMV/GEMM
+ * Target architecture: HiSilicon DaVinci dav-l310 (Kirin 9020)
+ *
+ * Execution tiers:
+ *   1. Coupled GEMV Fast-Path 1 (gemv_m1_panel_k1024, always_inline):
+ *      M == 1, 0 < K <= 1024, K % 128 == 0.
+ *      Full 32 x K panel double-buffered GM->UB DMA with dst_gap row padding,
+ *      VSELR byte-LUT dequantization into 4-slot NZ UB ring, 4-slot BL1 ring,
+ *      stationary AL1, L0A/L0B ping-pong, 32-slot circular L0C, NZ2ND Fixpipe.
+ *   2. Coupled GEMV Fast-Path 2 (gemv_m1_streaming, noinline):
+ *      M == 1, 1024 < K <= 32768, K % 128 == 0.
+ *      4-slot 24 KB streaming 32 x 256 GM->UB->BL1 pipeline + stationary AL1.
+ *   3. General Tiled GEMM Fallback (gemm_tiled_fallback, noinline):
+ *      Arbitrary (M, N, K) shapes (M=1 large K, M>=32 stationary/hybrid, M-tail, K<=0).
+ */
+
+#include "w3a16_defs.h"
+
+extern "C" __global__ [aicore] void
+w3a16_dequant_matmul(__gm__ uint8_t* /*ffts_addr*/,
+                     __gm__ uint8_t* /*sync_lock*/,
+                     __gm__ half*    x_gm,
+                     __gm__ int8_t*  qh_gm,
+                     __gm__ int8_t*  qs_gm,
+                     __gm__ half*    sc_gm,
+                     __gm__ int32_t* shape_ptr,
+                     __gm__ half*    out_gm,
+                     int32_t         /*grid_x*/,
+                     int32_t         /*grid_y*/,
+                     int32_t         /*grid_z*/) {
+  const int32_t M = shape_ptr[0];
+  const int32_t N = shape_ptr[1];
+  const int32_t K = shape_ptr[2];
+
+  constexpr int32_t k_align_mask = GEMV_K_ALIGN - 1;
+  if (M == 1 && K > 0 && K <= GEMV_STREAM_MAX_K && (K & k_align_mask) == 0) {
+    if (N > 0) {
+      uint64_t n_u64 = static_cast<uint32_t>(N);
+      uint64_t k_u64 = static_cast<uint32_t>(K);
+      if (K <= GEMV_PANEL_MAX_K) {
+        gemv_m1_panel_k1024(x_gm, qh_gm, qs_gm, sc_gm, out_gm, n_u64, k_u64);
+      } else {
+        gemv_m1_streaming(x_gm, qh_gm, qs_gm, sc_gm, out_gm, n_u64, k_u64);
+      }
+    }
+    pipe_barrier(PIPE_ALL);
+  } else {
+    gemm_tiled_fallback(x_gm, qh_gm, qs_gm, sc_gm, shape_ptr, out_gm);
+  }
+}

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SCRIPT_DIR}/../path.sh"
+
+if [ -n "${WS_KERNEL_OUTPUT_DIR:-}" ]; then
+    mkdir -p "${WS_KERNEL_OUTPUT_DIR}"
+    printf '%s\n' "$*" > "${WS_KERNEL_OUTPUT_DIR}/log-03-ld.lld.log"
+fi
+
+exec "${WS_BISHENG_INSTALL_PATH}/ld.lld" "$@"

@@ -1,0 +1,10 @@
+/workspace/examples/**/output*
+/workspace/examples/**/*.jpg
+/workspace/examples/w3a16.baseline
+/workspace/examples/w3a16_phone_test
+/*.tar.gz
+/workspace/venv
+/workspace/repos
+/build_docker/resources/cache
+**/__pycache__
+/docs

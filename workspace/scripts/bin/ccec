@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SCRIPT_DIR}/../path.sh"
+
+if [ -n "${WS_KERNEL_OUTPUT_DIR:-}" ]; then
+    mkdir -p "${WS_KERNEL_OUTPUT_DIR}"
+    KERNEL_NAME="${WS_KERNEL_NAME:-kernel}"
+    printf '%s\n' "$*" > "${WS_KERNEL_OUTPUT_DIR}/log-02-ccec.log"
+
+    for arg in "$@"; do
+        if [[ "${arg}" == *"kernel.ll"* ]] && [ -f "${arg}" ]; then
+            cp -f "${arg}" "${WS_KERNEL_OUTPUT_DIR}/05-${KERNEL_NAME}.ll"
+        fi
+    done
+fi
+
+exec "${WS_BISHENG_INSTALL_PATH}/ccec" "$@"

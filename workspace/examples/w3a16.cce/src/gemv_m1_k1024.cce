@@ -1,0 +1,179 @@
+/**
+ * Coupled GEMV Fast-Path 1: M == 1, 0 < K <= 1024, K % 128 == 0 (always_inline)
+ *
+ * Loads full 32 x K weight panels in 3 contiguous GM->UB DMAs with dst_gap
+ * padding each row to {128B, 256B, 64B}, hiding MTE2 latency across inner K tiles.
+ */
+
+#include "w3a16_defs.h"
+#include "l310_gemv_ops.h"
+#include "vf_gemv.h"
+
+extern "C" [aicore] __attribute__((always_inline)) void
+gemv_m1_panel_k1024(__gm__ half*   x_gm,
+                    __gm__ int8_t* qh_gm,
+                    __gm__ int8_t* qs_gm,
+                    __gm__ half*   sc_gm,
+                    __gm__ half*   out_gm,
+                    uint64_t       n_total,
+                    uint64_t       k_total) {
+  constexpr uint64_t k_groups_mask       = (2 * GEMV_PANEL_MAX_GROUPS) - 1; // 63: K/32 in [4..32]
+  constexpr uint64_t q4_gap_mask         = GEMV_PANEL_MAX_Q4 - 1;           //  7
+  constexpr uint64_t ring_mask           = GEMV_RING_SLOTS - 1;             //  3
+  constexpr uint64_t groups_per_sc_block = UB_BLOCK_BYTES / SC_BYTES_PER_GROUP; // 16
+  constexpr uint64_t wnz_blks_per_group  = (GEMV_N_TILE * QUANT_GROUP_SIZE) / FP16_PER_BLOCK; // 64
+  constexpr uint64_t k16_per_group       = QUANT_GROUP_SIZE / CUBE_FRACTAL; //  2
+
+  uint64_t k_groups = (k_total / QUANT_GROUP_SIZE) & k_groups_mask;
+  uint64_t k_q4     = k_groups / GEMV_K_TAIL_GROUPS; // K / 128 in [1..8]
+
+  set_mov_pad_zero();
+  set_fixpipe_loop3_unit();
+
+  // Slot 0 of input UB is used immediately by initial panel prefetch; arm slot 1 + downstream rings
+  set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+  gemv_arm_downstream_rings();
+
+  // Prefetch panel 0 (rows 0..min(N,32)-1) into input UB ping-pong slot 0
+  uint64_t first_n    = (n_total < GEMV_N_TILE) ? n_total : GEMV_N_TILE;
+  uint64_t qs_dst_gap = (GEMV_PANEL_MAX_Q4 - k_q4) & q4_gap_mask;
+  uint64_t qh_dst_gap = qs_dst_gap / 2;
+  uint64_t sc_dst_gap = qs_dst_gap / 4;
+
+  dma_load_gm_to_ub_rows(
+      reinterpret_cast<__ubuf__ int8_t*>(GEMV_P1024_QH_OFF),
+      qh_gm, first_n, k_q4 * (GEMV_K_TAIL_GROUPS * QH_BYTES_PER_GROUP), 0, qh_dst_gap);
+  dma_load_gm_to_ub_rows(
+      reinterpret_cast<__ubuf__ int8_t*>(GEMV_P1024_QS_OFF),
+      qs_gm, first_n, k_q4 * (GEMV_K_TAIL_GROUPS * QS_BYTES_PER_GROUP), 0, qs_dst_gap);
+  dma_load_gm_to_ub_rows(
+      reinterpret_cast<__ubuf__ half*>(GEMV_P1024_SC_OFF),
+      sc_gm, first_n, k_q4 * (GEMV_K_TAIL_GROUPS * SC_BYTES_PER_GROUP), 0, sc_dst_gap);
+  set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+  // Initialize VSELR LUTs in UB while loading full 1 x K activation vector into AL1
+  init_gemv_subbyte_luts();
+
+  dma_load_gm_to_l1_bytes(
+      reinterpret_cast<__cbuf__ half*>(GEMV_AL1_BASE), x_gm, k_groups * ACT_BYTES_PER_GROUP);
+  set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+  wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+
+  uint64_t n_col = 0;
+  uint64_t k_grp = 0;
+  uint64_t t_ctr = 0;
+
+  do {
+    uint64_t in_pp      = (n_col / GEMV_N_TILE) & 1ULL;
+    uint64_t in_base    = in_pp * GEMV_P1024_IN_STRIDE;
+    bool     is_k_first = (k_grp == 0);
+
+    if (is_k_first) {
+      wait_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(in_pp));
+    }
+
+    uint64_t rem_n      = n_total - n_col;
+    uint64_t cur_n      = (rem_n < GEMV_N_TILE) ? rem_n : GEMV_N_TILE;
+    int32_t  cur_n_i32  = static_cast<int32_t>(cur_n);
+    uint64_t w_slot     = t_ctr & ring_mask;
+    uint64_t ab_pp      = t_ctr & 1ULL;
+    uint64_t next_t_ctr = t_ctr + 1;
+    uint64_t next_k_grp = k_grp + GEMV_K_STEP_GROUPS;
+    bool     has_more_k = (next_k_grp < k_groups);
+    uint64_t rem_k_grp  = k_groups - k_grp;
+
+    // VLDS requires 32B-aligned UB addresses: groups 0..15 vs 16..31 select the 32B scale block,
+    // while groups 0..7 vs 8..15 select the 16B sub-offset inside VSELR.
+    uint64_t kg_sub = k_grp & (GEMV_PANEL_MAX_GROUPS - 1);
+    __ubuf__ int8_t* qh_ub = reinterpret_cast<__ubuf__ int8_t*>(
+        in_base + GEMV_P1024_QH_OFF + kg_sub * QH_BYTES_PER_GROUP);
+    __ubuf__ int8_t* qs_ub = reinterpret_cast<__ubuf__ int8_t*>(
+        in_base + GEMV_P1024_QS_OFF + kg_sub * QS_BYTES_PER_GROUP);
+    __ubuf__ int8_t* sc_ub = reinterpret_cast<__ubuf__ int8_t*>(
+        in_base + GEMV_P1024_SC_OFF + (kg_sub & groups_per_sc_block) * SC_BYTES_PER_GROUP);
+    uint8_t sc_byte_off = static_cast<uint8_t>((kg_sub & GEMV_K_STEP_GROUPS) * SC_BYTES_PER_GROUP);
+
+    __ubuf__ half* w_nz_ub = reinterpret_cast<__ubuf__ half*>(
+        GEMV_P1024_WNZ_BASE + w_slot * GEMV_WNZ_SLOT_BYTES);
+    __ubuf__ int8_t* lut   = reinterpret_cast<__ubuf__ int8_t*>(GEMV_LUT_UB_BASE);
+
+    wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(w_slot));
+    if (rem_k_grp <= GEMV_K_TAIL_GROUPS) {
+      vf_dequant_p1024_t128(qh_ub, qs_ub, sc_ub, w_nz_ub, lut, cur_n_i32, sc_byte_off);
+    } else {
+      vf_dequant_p1024_t256(qh_ub, qs_ub, sc_ub, w_nz_ub, lut, cur_n_i32, sc_byte_off);
+    }
+    set_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(w_slot));
+
+    // On first K-subtile, overlap GM->UB prefetch of next 32xK panel into opposite buffer
+    uint64_t next_n_col = n_col + GEMV_N_TILE;
+    if (is_k_first && next_n_col < n_total) {
+      uint64_t next_pp   = in_pp ^ 1ULL;
+      uint64_t next_base = next_pp * GEMV_P1024_IN_STRIDE;
+      wait_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(next_pp));
+
+      // Anchor stride arithmetic to loop-carried t_ctr (zero == 0) so LLVM LICM keeps
+      // inner-loop scalar registers spill-free
+      uint64_t zero     = next_t_ctr >> 32;
+      uint64_t kg_live  = (k_groups + zero) & k_groups_mask;
+      uint64_t kq4_live = kg_live / GEMV_K_TAIL_GROUPS;
+      uint64_t gap_qs   = (GEMV_PANEL_MAX_Q4 - kq4_live) & q4_gap_mask;
+      uint64_t nxt_rem  = n_total - next_n_col;
+      uint64_t nxt_n    = (nxt_rem < GEMV_N_TILE) ? nxt_rem : GEMV_N_TILE;
+      uint64_t gm_sc_ix = next_n_col * kg_live;
+
+      dma_load_gm_to_ub_rows(
+          reinterpret_cast<__ubuf__ int8_t*>(next_base + GEMV_P1024_QH_OFF),
+          qh_gm + gm_sc_ix * QH_BYTES_PER_GROUP, nxt_n,
+          kg_live * QH_BYTES_PER_GROUP, 0, gap_qs / 2);
+      dma_load_gm_to_ub_rows(
+          reinterpret_cast<__ubuf__ int8_t*>(next_base + GEMV_P1024_QS_OFF),
+          qs_gm + gm_sc_ix * QS_BYTES_PER_GROUP, nxt_n,
+          kg_live * QS_BYTES_PER_GROUP, 0, gap_qs);
+      dma_load_gm_to_ub_rows(
+          reinterpret_cast<__ubuf__ half*>(next_base + GEMV_P1024_SC_OFF),
+          sc_gm + gm_sc_ix, nxt_n,
+          kg_live * SC_BYTES_PER_GROUP, 0, gap_qs / 4);
+      set_flag(PIPE_MTE2, PIPE_V, static_cast<event_t>(next_pp));
+    }
+
+    uint64_t cur_k_grp = (rem_k_grp < GEMV_K_STEP_GROUPS) ? rem_k_grp : GEMV_K_STEP_GROUPS;
+    __cbuf__ half* bl1 = reinterpret_cast<__cbuf__ half*>(GEMV_BL1_BASE + w_slot * GEMV_BL1_STRIDE);
+
+    wait_flag(PIPE_MTE1, PIPE_MTE3, static_cast<event_t>(w_slot));
+    wait_flag(PIPE_V,    PIPE_MTE3, static_cast<event_t>(w_slot));
+    dma_copy_ub_to_l1_blocks(bl1, w_nz_ub, cur_k_grp * wnz_blks_per_group);
+    set_flag(PIPE_MTE3, PIPE_V,    static_cast<event_t>(w_slot));
+    set_flag(PIPE_MTE3, PIPE_MTE1, static_cast<event_t>(w_slot));
+
+    __cbuf__ half* al1 = reinterpret_cast<__cbuf__ half*>(
+        GEMV_AL1_BASE + k_grp * ACT_BYTES_PER_GROUP);
+    wait_flag(PIPE_MTE3, PIPE_MTE1, static_cast<event_t>(w_slot));
+    wait_flag(PIPE_M,    PIPE_MTE1, static_cast<event_t>(ab_pp));
+    cube_gemv_load2d_f16(al1, bl1, ab_pp, cur_k_grp * k16_per_group, cur_n, GEMV_N_FRACTALS);
+    set_flag(PIPE_MTE1, PIPE_M,    static_cast<event_t>(ab_pp));
+    set_flag(PIPE_MTE1, PIPE_MTE3, static_cast<event_t>(w_slot));
+
+    wait_flag(PIPE_MTE1, PIPE_M, static_cast<event_t>(ab_pp));
+    __cc__ half* l0c = gemv_l0c_slot_ptr(n_col);
+    uint8_t uf       = has_more_k ? UF_MODE_ACCUM : UF_MODE_FINAL;
+    cube_gemv_mad_f16(l0c, ab_pp, cur_k_grp * QUANT_GROUP_SIZE, cur_n, is_k_first, uf);
+    set_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(ab_pp));
+
+    t_ctr = next_t_ctr;
+    if (has_more_k) {
+      k_grp = next_k_grp;
+    } else {
+      set_flag(PIPE_V, PIPE_MTE2, static_cast<event_t>(in_pp));
+      uint64_t zero       = next_t_ctr >> 32;
+      uint64_t dst_stride = static_cast<uint32_t>(n_total + zero);
+      fixpipe_store_m1_nz2nd(out_gm + n_col, l0c, cur_n, dst_stride);
+      k_grp = 0;
+      n_col = next_n_col;
+    }
+  } while (n_col < n_total);
+
+  wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+  wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+  gemv_drain_downstream_rings();
+}

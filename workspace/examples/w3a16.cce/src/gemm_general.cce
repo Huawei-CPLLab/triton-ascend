@@ -1,0 +1,355 @@
+/**
+ * General Tiled GEMM Fallback (Arbitrary M, N, K):
+ *   - Sub-Path A : M == 1 && num_k <= 448 stationary 1 x K AL1 + 16 x 512 VINTLV weight ring
+ *   - Sub-Path B : M >= 32 multi-row stationary / hybrid AL1 (in gemm_multi_m.cce)
+ *   - Sub-Path C : 1..16 row M-tail streaming AL1 with exact row clamping
+ *   - Edge Case  : K <= 0 zero-tile VF + 2D UB->GM store
+ */
+
+#include "w3a16_defs.h"
+#include "gemm_weight_ring.h"
+
+namespace {
+
+// Clamps row count of a 16-row M-tile [m_base .. min(m_base + 16, max(M, m_base)))
+static inline [aicore] __attribute__((always_inline)) int64_t
+clamp_mtile_rows(int64_t m_base, int64_t m_total) {
+  int64_t m_clamp = (m_total > m_base) ? m_total : m_base;
+  int64_t m_end   = (static_cast<uint64_t>(m_base + GEMM_M_TILE) < static_cast<uint64_t>(m_clamp))
+                        ? (m_base + GEMM_M_TILE)
+                        : m_clamp;
+  return m_end - m_base;
+}
+
+// Sub-Path A: M == 1 && num_k <= 448 (Stationary 1 x K AL1 @ GEN_AL1_STATIC_BASE)
+static inline [aicore] __attribute__((always_inline)) void
+gemm_m1_stationary(__gm__ half* x_gm, __gm__ int8_t* qh_gm,
+                   __gm__ int8_t* qs_gm, __gm__ half* sc_gm,
+                   __gm__ half* out_gm,
+                   int32_t n_tiles_raw, int32_t num_n, int32_t num_k,
+                   int32_t last_k_idx, int64_t k_tail, int64_t k_i64,
+                   int64_t n_i64, int64_t k_groups, int32_t sc_n_step_i32,
+                   uint64_t& w_iter, uint64_t& c_iter) {
+  constexpr uint64_t ring_mask = GEN_W_RING_SLOTS - 1;
+
+  if (n_tiles_raw > 0) {
+    weight_ring_load_tile(qh_gm, qs_gm, sc_gm, 0, k_groups, w_iter & ring_mask);
+  }
+  dma_load_gm_to_l1_1d(
+      x_gm, k_i64, reinterpret_cast<__cbuf__ half*>(GEN_AL1_STATIC_BASE));
+  set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+  wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+
+  int32_t sc_n_i32 = 0;
+  for (int32_t n_idx = 0; n_idx < num_n; ++n_idx) {
+    uint64_t l0c_off    = (c_iter & 1ULL) * FRACTAL_BYTES_F16;
+    __cc__ half* l0c    = reinterpret_cast<__cc__ half*>(l0c_off);
+    int32_t  next_sc_n  = sc_n_i32 + sc_n_step_i32;
+    int64_t  sc_n_base  = static_cast<int64_t>(sc_n_i32);
+    bool     has_next_n = static_cast<uint32_t>(n_idx + 1) < static_cast<uint32_t>(num_n);
+    bool     is_last_n  = static_cast<uint32_t>(n_idx + 1) >= static_cast<uint32_t>(num_n);
+
+    for (int32_t k_idx = 0; k_idx < num_k; ++k_idx) {
+      uint64_t cur_w    = w_iter;
+      uint64_t cur_slot = cur_w & ring_mask;
+      uint64_t cur_ev   = (cur_w & 1ULL) ^ 1ULL;
+
+      weight_ring_prefetch_next(qh_gm, qs_gm, sc_gm, k_idx, num_k, has_next_n,
+                                sc_n_base, static_cast<int64_t>(next_sc_n), k_groups, cur_w);
+      weight_ring_dequant_slot(cur_slot);
+
+      if (static_cast<uint32_t>(k_idx) > 0U) {
+        int32_t  prev_k = k_idx - 1;
+        uint64_t prev_w = cur_w - 1ULL;
+        uint64_t mte3_ev;
+        __cbuf__ half* bl1 = weight_ring_stage_prev_to_bl1(prev_w, mte3_ev);
+        __cbuf__ half* al1 = reinterpret_cast<__cbuf__ half*>(
+            GEN_AL1_STATIC_BASE + static_cast<uint64_t>(static_cast<int64_t>(prev_k)) * GEMM_M1_K_TILE_BYTES);
+        cube_mma_tile_f16_tb(al1, bl1, (prev_k == 0), 1, GEMM_K_TILE,
+                             l0c, 1, static_cast<int64_t>(prev_w), 0, 1, UF_MODE_ACCUM);
+        set_flag(PIPE_MTE1, PIPE_MTE3, static_cast<event_t>(mte3_ev));
+      } else if (static_cast<uint32_t>(n_idx) > 0U) {
+        int32_t  prev_n = n_idx - 1;
+        int32_t  prev_k = num_k - 1;
+        uint64_t prev_w = cur_w - 1ULL;
+        uint64_t mte3_ev;
+        __cc__ half* prev_l0c = reinterpret_cast<__cc__ half*>(l0c_off ^ FRACTAL_BYTES_F16);
+        __cbuf__ half* bl1    = weight_ring_stage_prev_to_bl1(prev_w, mte3_ev);
+        __cbuf__ half* al1    = reinterpret_cast<__cbuf__ half*>(
+            GEN_AL1_STATIC_BASE + static_cast<uint64_t>(static_cast<int64_t>(prev_k)) * GEMM_M1_K_TILE_BYTES);
+        cube_mma_tile_f16_tb(al1, bl1, (prev_k == 0), 1, k_tail,
+                             prev_l0c, 1, static_cast<int64_t>(prev_w), 0, 1, UF_MODE_FINAL);
+        fixpipe_store_tile_nz2nd(prev_l0c, out_gm,
+                                 static_cast<int64_t>(prev_n * static_cast<int32_t>(GEMM_N_TILE)),
+                                 1, GEMM_N_TILE, n_i64, UF_MODE_FINAL);
+        set_flag(PIPE_MTE1, PIPE_MTE3, static_cast<event_t>(mte3_ev));
+      }
+
+      wait_flag(PIPE_MTE1, PIPE_MTE3, static_cast<event_t>(cur_ev));
+      w_iter = cur_w + 1ULL;
+    }
+
+    if (is_last_n) {
+      uint64_t prev_w = w_iter - 1ULL;
+      uint64_t mte3_ev;
+      __cbuf__ half* bl1 = weight_ring_stage_prev_to_bl1(prev_w, mte3_ev);
+      __cbuf__ half* al1 = reinterpret_cast<__cbuf__ half*>(
+          GEN_AL1_STATIC_BASE + static_cast<uint64_t>(static_cast<int64_t>(last_k_idx)) * GEMM_M1_K_TILE_BYTES);
+      cube_mma_tile_f16_tb(al1, bl1, (last_k_idx == 0), 1, k_tail,
+                           l0c, 1, static_cast<int64_t>(prev_w), 0, 1, UF_MODE_FINAL);
+      fixpipe_store_tile_nz2nd(l0c, out_gm,
+                               static_cast<int64_t>(n_idx * static_cast<int32_t>(GEMM_N_TILE)),
+                               1, GEMM_N_TILE, n_i64, UF_MODE_FINAL);
+      set_flag(PIPE_MTE1, PIPE_MTE3, static_cast<event_t>(mte3_ev));
+    }
+
+    ++c_iter;
+    sc_n_i32 = next_sc_n;
+  }
+}
+
+// Sub-Path C: Remaining M-Tail Tiles (1..16 rows per tile, streaming AL1)
+static inline [aicore] __attribute__((always_inline)) void
+gemm_mtail_streaming(__gm__ half* x_gm, __gm__ int8_t* qh_gm,
+                     __gm__ int8_t* qs_gm, __gm__ half* sc_gm,
+                     __gm__ half* out_gm,
+                     int32_t m_done_t16, int32_t m_tiles_raw, int32_t n_tiles_raw,
+                     int32_t num_n, int32_t num_k, int32_t last_k_idx,
+                     int64_t k_tail, int64_t m_i64, int64_t n_i64, int64_t k_i64,
+                     int64_t k_groups, int32_t sc_n_step_i32,
+                     uint64_t& w_iter, uint64_t& c_iter) {
+  constexpr uint64_t ring_mask        = GEN_W_RING_SLOTS - 1;
+  constexpr uint64_t stream_al1_step  = 2 * GEN_AL1_TILE_BYTES; // {0 KB, 32 KB}
+
+  bool single_k = (last_k_idx == 0);
+  for (int32_t m_tile = m_done_t16; m_tile < m_tiles_raw; ++m_tile) {
+    int64_t m_base   = static_cast<int64_t>(m_tile * static_cast<int32_t>(GEMM_M_TILE));
+    int64_t m_actual = clamp_mtile_rows(m_base, m_i64);
+
+    if (n_tiles_raw > 0) {
+      weight_ring_load_tile(qh_gm, qs_gm, sc_gm, 0, k_groups, w_iter & ring_mask);
+    }
+
+    int64_t x_m_base   = m_base * k_i64;
+    int64_t out_m_base = m_base * n_i64;
+    int32_t sc_n_i32   = 0;
+
+    for (int32_t n_idx = 0; n_idx < num_n; ++n_idx) {
+      __cc__ half* l0c   = reinterpret_cast<__cc__ half*>((c_iter & 1ULL) * FRACTAL_BYTES_F16);
+      int32_t next_sc_n  = sc_n_i32 + sc_n_step_i32;
+      int64_t sc_n_base  = static_cast<int64_t>(sc_n_i32);
+      bool    has_next_n = static_cast<uint32_t>(n_idx + 1) < static_cast<uint32_t>(num_n);
+
+      for (int32_t k_idx = 0; k_idx < num_k; ++k_idx) {
+        uint64_t cur_w    = w_iter;
+        uint64_t cur_slot = cur_w & ring_mask;
+        uint64_t cur_pp   = cur_w & 1ULL;
+        uint64_t cur_ev   = cur_pp ^ 1ULL;
+
+        weight_ring_prefetch_next(qh_gm, qs_gm, sc_gm, k_idx, num_k, has_next_n,
+                                  sc_n_base, static_cast<int64_t>(next_sc_n), k_groups, cur_w);
+        weight_ring_dequant_slot(cur_slot);
+
+        if (static_cast<uint32_t>(k_idx) > 0U) {
+          int32_t  prev_k = k_idx - 1;
+          uint64_t prev_w = cur_w - 1ULL;
+          uint64_t mte3_ev;
+          __cbuf__ half* bl1 = weight_ring_stage_prev_to_bl1(prev_w, mte3_ev);
+          __cbuf__ half* al1 = reinterpret_cast<__cbuf__ half*>((prev_w & 1ULL) * stream_al1_step);
+          cube_mma_tile_f16_tb(al1, bl1, (prev_k == 0), GEMM_M_TILE, GEMM_K_TILE,
+                               l0c, 1, static_cast<int64_t>(prev_w), 0, 1, UF_MODE_ACCUM);
+          set_flag(PIPE_MTE1, PIPE_MTE3, static_cast<event_t>(mte3_ev));
+        }
+
+        __ubuf__ half* act_ub = reinterpret_cast<__ubuf__ half*>(
+            GEN_ACT_UB_PING + cur_pp * GEN_ACT_TILE_BYTES);
+        __cbuf__ half* cur_al1 = reinterpret_cast<__cbuf__ half*>(cur_pp * stream_al1_step);
+
+        int64_t k_cur = (k_idx == last_k_idx) ? k_tail : GEMM_K_TILE;
+        wait_flag(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(cur_ev));
+        dma_load_gm_to_ub_2d(
+            x_gm, x_m_base + static_cast<int64_t>(k_idx * static_cast<int32_t>(GEMM_K_TILE)),
+            m_actual, k_cur, k_i64, act_ub, GEMM_K_TILE);
+        set_flag(PIPE_MTE2, PIPE_MTE3, static_cast<event_t>(cur_ev));
+
+        wait_flag(PIPE_MTE1, PIPE_MTE3, static_cast<event_t>(cur_ev));
+        wait_flag(PIPE_MTE2, PIPE_MTE3, static_cast<event_t>(cur_ev));
+        dma_copy_ub_to_l1_nd2nz(act_ub, m_actual, cur_al1);
+        set_flag(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(cur_ev));
+
+        w_iter = cur_w + 1ULL;
+      }
+
+      uint64_t prev_w = w_iter - 1ULL;
+      uint64_t mte3_ev;
+      __cbuf__ half* bl1 = weight_ring_stage_prev_to_bl1(prev_w, mte3_ev);
+      __cbuf__ half* al1 = reinterpret_cast<__cbuf__ half*>((prev_w & 1ULL) * stream_al1_step);
+      cube_mma_tile_f16_tb(al1, bl1, single_k, GEMM_M_TILE, k_tail,
+                           l0c, 1, static_cast<int64_t>(prev_w), 0, 1, UF_MODE_FINAL);
+      fixpipe_store_tile_nz2nd(l0c, out_gm,
+                               out_m_base + static_cast<int64_t>(n_idx * static_cast<int32_t>(GEMM_N_TILE)),
+                               m_actual, GEMM_N_TILE, n_i64, UF_MODE_FINAL);
+      set_flag(PIPE_MTE1, PIPE_MTE3, static_cast<event_t>(mte3_ev));
+
+      ++c_iter;
+      sc_n_i32 = next_sc_n;
+    }
+  }
+}
+
+// Edge Case: K <= 0 -> Fill [M, N] output with zeros via VF + 2D DMA
+static inline [aicore] __attribute__((always_inline)) void
+gemm_zero_output(__gm__ half* out_gm, int32_t M, int32_t N,
+                 int32_t num_m, int32_t num_n, uint64_t& z_iter) {
+  int64_t n_i64 = static_cast<int64_t>(N);
+  int64_t m_i64 = static_cast<int64_t>(M);
+
+  for (int32_t m_tile = 0; m_tile < num_m; ++m_tile) {
+    uint64_t ping          = z_iter & 1ULL;
+    uint64_t ev            = ping ^ 1ULL;
+    __ubuf__ half* ub_zero = reinterpret_cast<__ubuf__ half*>(ping * FRACTAL_BYTES_F16);
+
+    int64_t m_base   = static_cast<int64_t>(m_tile * static_cast<int32_t>(GEMM_M_TILE));
+    int64_t m_actual = clamp_mtile_rows(m_base, m_i64);
+
+    wait_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(ev));
+    vf_zero_tile_16x16(ub_zero);
+    set_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(ev));
+    wait_flag(PIPE_V, PIPE_MTE3, static_cast<event_t>(ev));
+
+    int64_t out_m_base = m_base * n_i64;
+    for (int32_t n_tile = 0; n_tile < num_n; ++n_tile) {
+      pipe_barrier(PIPE_MTE3);
+      dma_store_ub_to_gm_2d(
+          ub_zero, GEMM_N_TILE, out_gm,
+          out_m_base + static_cast<int64_t>(n_tile * static_cast<int32_t>(GEMM_N_TILE)),
+          m_actual, GEMM_N_TILE, n_i64);
+    }
+    set_flag(PIPE_MTE3, PIPE_V, static_cast<event_t>(ev));
+    ++z_iter;
+  }
+}
+
+} // namespace
+
+extern "C" [aicore] __attribute__((noinline)) void
+gemm_tiled_fallback(__gm__ half*    x_gm,
+                    __gm__ int8_t*  qh_gm,
+                    __gm__ int8_t*  qs_gm,
+                    __gm__ half*    sc_gm,
+                    __gm__ int32_t* shape_ptr,
+                    __gm__ half*    out_gm) {
+  uint64_t z_iter = 0;
+  uint64_t c_iter = 0;
+  uint64_t w_iter = 0;
+
+  set_ctrl(sbitset0(get_ctrl(), CTRL_BIT_VF_SAT_OVERRIDE));
+  set_ctrl(sbitset1(get_ctrl(), CTRL_BIT_FP_SATURATION));
+
+  int32_t M = shape_ptr[0];
+  int32_t N = shape_ptr[1];
+  int32_t K = shape_ptr[2];
+
+  constexpr int32_t m_tile_i32 = static_cast<int32_t>(GEMM_M_TILE);
+  constexpr int32_t n_tile_i32 = static_cast<int32_t>(GEMM_N_TILE);
+  constexpr int32_t k_tile_i32 = static_cast<int32_t>(GEMM_K_TILE);
+
+  int32_t m_tiles_raw = (M + m_tile_i32 - 1) / m_tile_i32;
+  int32_t num_m       = (m_tiles_raw > 0) ? m_tiles_raw : 0;
+  int32_t n_tiles_raw = (N + n_tile_i32 - 1) / n_tile_i32;
+  int32_t num_n       = (n_tiles_raw > 0) ? n_tiles_raw : 0;
+  int32_t k_tiles_raw = (K + k_tile_i32 - 1) / k_tile_i32;
+  int32_t num_k       = (k_tiles_raw > 0) ? k_tiles_raw : 0;
+  int32_t last_k_idx  = k_tiles_raw - 1;
+  int64_t k_tail      = static_cast<int64_t>(K - last_k_idx * k_tile_i32);
+  int32_t k_grp_i32   = K >> QUANT_GROUP_SHIFT;
+
+  set_flag(PIPE_MTE3, PIPE_V,    EVENT_ID0);
+  set_flag(PIPE_MTE3, PIPE_V,    EVENT_ID1);
+  set_flag(PIPE_M,    PIPE_MTE1, EVENT_ID0);
+  set_flag(PIPE_M,    PIPE_MTE1, EVENT_ID1);
+
+  if (k_tiles_raw > 0) {
+    int64_t k_i64         = static_cast<int64_t>(K);
+    int64_t m_i64         = static_cast<int64_t>(M);
+    int64_t n_i64         = static_cast<int64_t>(N);
+    int64_t k_groups      = static_cast<int64_t>(k_grp_i32);
+    int32_t sc_n_step_i32 = k_grp_i32 * n_tile_i32;
+
+    set_flag(PIPE_MTE3, PIPE_V,    EVENT_ID2);
+    set_flag(PIPE_MTE3, PIPE_V,    EVENT_ID3);
+    set_flag(PIPE_V,    PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_V,    PIPE_MTE2, EVENT_ID1);
+    set_flag(PIPE_V,    PIPE_MTE2, EVENT_ID2);
+    set_flag(PIPE_V,    PIPE_MTE2, EVENT_ID3);
+    set_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
+    set_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID1);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+
+    if (M == 1 && k_tiles_raw <= GEMM_M1_MAX_K_TILES) {
+      gemm_m1_stationary(x_gm, qh_gm, qs_gm, sc_gm, out_gm,
+                         n_tiles_raw, num_n, num_k, last_k_idx, k_tail,
+                         k_i64, n_i64, k_groups, sc_n_step_i32, w_iter, c_iter);
+    } else {
+      uint32_t m_pos      = (M > 0) ? static_cast<uint32_t>(M) : 0U;
+      int32_t  full_m_t16 = static_cast<int32_t>(m_pos / static_cast<uint32_t>(GEMM_M_TILE));
+      int32_t  m_done_t16 = 0;
+
+      if (static_cast<uint32_t>(full_m_t16) >= static_cast<uint32_t>(GEMM_M32_TILES)) {
+        if (k_tiles_raw <= GEMM_M128_MAX_K_TILES &&
+            static_cast<uint32_t>(full_m_t16) >= static_cast<uint32_t>(GEMM_M128_TILES)) {
+          m_done_t16 = gemm_m128_stationary(
+              x_gm, qh_gm, qs_gm, sc_gm, out_gm,
+              full_m_t16, n_tiles_raw, num_n, num_k, last_k_idx,
+              k_tail, k_i64, n_i64, k_groups, sc_n_step_i32, w_iter, c_iter);
+        } else {
+          int32_t m_limit_2 = full_m_t16 & -GEMM_M32_TILES;
+          int64_t x_16row   = k_i64 * GEMM_M_TILE;
+          int64_t out_16row = n_i64 * GEMM_M_TILE;
+          if (k_tiles_raw <= GEMM_M32_MAX_K_TILES) {
+            gemm_m32_stationary(
+                x_gm, qh_gm, qs_gm, sc_gm, out_gm,
+                m_limit_2, n_tiles_raw, num_n, num_k, last_k_idx,
+                k_tail, k_i64, n_i64, x_16row, out_16row,
+                k_groups, sc_n_step_i32, w_iter, c_iter);
+          } else {
+            gemm_m32_hybrid(
+                x_gm, qh_gm, qs_gm, sc_gm, out_gm,
+                m_limit_2, n_tiles_raw, num_n, num_k, last_k_idx,
+                k_tail, k_i64, n_i64, x_16row, out_16row,
+                k_groups, sc_n_step_i32, w_iter, c_iter);
+          }
+          m_done_t16 = m_limit_2;
+        }
+      }
+
+      if (m_done_t16 < m_tiles_raw) {
+        gemm_mtail_streaming(
+            x_gm, qh_gm, qs_gm, sc_gm, out_gm,
+            m_done_t16, m_tiles_raw, n_tiles_raw, num_n, num_k, last_k_idx,
+            k_tail, m_i64, n_i64, k_i64, k_groups, sc_n_step_i32, w_iter, c_iter);
+      }
+    }
+
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+    wait_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_MTE3, EVENT_ID1);
+    wait_flag(PIPE_V,    PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_V,    PIPE_MTE2, EVENT_ID1);
+    wait_flag(PIPE_V,    PIPE_MTE2, EVENT_ID2);
+    wait_flag(PIPE_V,    PIPE_MTE2, EVENT_ID3);
+    wait_flag(PIPE_MTE3, PIPE_V,    EVENT_ID2);
+    wait_flag(PIPE_MTE3, PIPE_V,    EVENT_ID3);
+  } else {
+    gemm_zero_output(out_gm, M, N, num_m, num_n, z_iter);
+  }
+
+  wait_flag(PIPE_M,    PIPE_MTE1, EVENT_ID0);
+  wait_flag(PIPE_M,    PIPE_MTE1, EVENT_ID1);
+  wait_flag(PIPE_MTE3, PIPE_V,    EVENT_ID0);
+  wait_flag(PIPE_MTE3, PIPE_V,    EVENT_ID1);
+  set_ctrl(sbitset1(get_ctrl(), CTRL_BIT_VF_SAT_OVERRIDE));
+  pipe_barrier(PIPE_ALL);
+}

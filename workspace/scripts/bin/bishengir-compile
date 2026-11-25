@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${SCRIPT_DIR}/../path.sh"
+
+if [ -z "${WS_KERNEL_OUTPUT_DIR:-}" ]; then
+    exec "${WS_NPUIR_INSTALL_PATH}/bishengir-compile" "$@"
+fi
+
+mkdir -p "${WS_KERNEL_OUTPUT_DIR}"
+KERNEL_NAME="${WS_KERNEL_NAME:-kernel}"
+printf '%s\n' "$*" > "${WS_KERNEL_OUTPUT_DIR}/log-01-bishengir-compile.log"
+
+SAVE_TEMPS_DIR=""
+CLEANUP_SAVE_TEMPS=0
+EXTRA_ARGS=()
+
+for arg in "$@"; do
+    case "${arg}" in
+        --save-temps=*)
+            SAVE_TEMPS_DIR="${arg#--save-temps=}"
+            ;;
+    esac
+done
+
+if [ -z "${SAVE_TEMPS_DIR}" ]; then
+    SAVE_TEMPS_DIR="$(mktemp -d)"
+    CLEANUP_SAVE_TEMPS=1
+    EXTRA_ARGS+=("--save-temps=${SAVE_TEMPS_DIR}")
+fi
+
+set +e
+"${WS_NPUIR_INSTALL_PATH}/bishengir-compile" "$@" "${EXTRA_ARGS[@]}"
+RC=$?
+set -e
+
+if [ -f "${SAVE_TEMPS_DIR}/module.hivm.opt.mlir" ]; then
+    cp -f "${SAVE_TEMPS_DIR}/module.hivm.opt.mlir" \
+        "${WS_KERNEL_OUTPUT_DIR}/04-${KERNEL_NAME}.hivm.opt.mlir"
+fi
+
+if [ -f "${SAVE_TEMPS_DIR}/kernel.ll" ] && [ ! -f "${WS_KERNEL_OUTPUT_DIR}/05-${KERNEL_NAME}.ll" ]; then
+    cp -f "${SAVE_TEMPS_DIR}/kernel.ll" \
+        "${WS_KERNEL_OUTPUT_DIR}/05-${KERNEL_NAME}.ll"
+fi
+
+if [ "${CLEANUP_SAVE_TEMPS}" = "1" ]; then
+    rm -rf "${SAVE_TEMPS_DIR}"
+fi
+
+exit "${RC}"
